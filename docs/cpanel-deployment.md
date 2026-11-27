@@ -1,0 +1,357 @@
+# Deploying Active Digital Hub on cPanel
+
+**Upload the files → create the database → import one SQL file → edit `.env` →
+open the domain.** That is the whole process. No Terminal, no SSH, no Composer,
+no Node.js, no migration command, no seed command, no installer script.
+
+The numbered installation steps below are for a new database or a move to a
+new hosting account. **Do not import the complete new-install SQL over a live
+database that already contains customers or transactions.** Existing-install
+updates use the included release-specific upgrade files described below.
+
+### Updating an existing installation
+
+1. Export a complete database backup in phpMyAdmin.
+2. Upload/extract the updated application package, preserving the current
+   `.env`, user uploads, and storage data.
+3. In phpMyAdmin, select the existing database and import
+   `database/upgrade-042-deposit-currency.sql` (if the deposit-currency columns
+   have not already been added).
+4. Import `database/upgrade-branding-active-digital-hub.sql` to refresh legacy
+   default name and colour values while preserving custom settings.
+5. Open `/deploy-verify.php`; confirm every schema check passes, then delete the
+   verifier.
+
+The upgrade is repeatable and preserves all live records. Until it is imported,
+Admin → Payments falls back to legacy totals and displays an upgrade warning
+instead of failing with a blank HTTP 500 page. New deposits should not be
+accepted until the schema check is green.
+
+---
+
+## What you need
+
+| | |
+| --- | --- |
+| Hosting | cPanel with PHP **8.1+** and MySQL 5.7+ / MariaDB 10.4+ |
+| PHP extensions | `mysqli`, `mbstring`, `openssl`, `curl`, `json`, `bcmath` (cPanel → Select PHP Version → Extensions) |
+| The package | `application-deployment.zip` — published as a **release artifact** (GitHub → Releases), or built locally with `bash tools/build_deployment_package.sh`. It is a build artifact and is not committed to git. Contains index.php, application/, system/, assets/, storage/, cron/, database/marvysocials.sql, the migration-042 upgrade SQL, and .env.example. |
+
+Nothing else. The framework is inside the package, so `composer install` is
+never required; the CSS is pre-built, so `npm install` is never required.
+
+---
+
+## 1. Upload
+
+1. **cPanel → File Manager**.
+2. Open the directory your domain serves — usually `public_html`, or
+   `public_html/subdomain` for an addon/subdomain.
+3. **Upload** `application-deployment.zip`.
+4. Select it → **Extract**.
+5. Check that `index.php` sits *directly* in that directory, next to
+   `application/`, `system/` and `assets/`. If the extract created an extra
+   folder level, select everything inside it and **Move** it up one level.
+
+Delete the zip when you are done.
+
+---
+
+## 2. Create the database
+
+**cPanel → MySQL® Databases**:
+
+1. **Create New Database** — e.g. `panel`. cPanel prefixes it with your account
+   name, so the real name becomes something like `myaccount_panel`.
+2. **Add New User** — e.g. `panel`, with a long random password. Real name:
+   `myaccount_panel`.
+3. **Add User To Database** → tick **ALL PRIVILEGES** → *Make Changes*.
+
+Write down the three prefixed values: **database name**, **user name**,
+**password**. They go into `.env` in step 4.
+
+---
+
+## 3. Import the database
+
+**cPanel → phpMyAdmin**:
+
+1. Select the database you just created in the left-hand list.
+2. Open the **Import** tab.
+3. **Choose file** → `database/marvysocials.sql` from the extracted package
+   (download it from File Manager first if your browser needs a local copy).
+4. Press **Go**.
+
+That single file creates everything: all tables, columns, indexes and foreign
+keys, the migration bookkeeping, roles, permissions, application settings,
+feature flags, payment methods, email templates, FAQs, currencies, the VTU /
+numbers / identity / gift card catalogues, marketplace categories — and the
+first-login accounts (SUPER_ADMIN, customer, staff).
+
+**There is no migration step and no seed step afterwards.** The database is
+finished when the import finishes.
+
+> If phpMyAdmin refuses the upload because the file is larger than the host's
+> limit, compress it first (`marvysocials.sql.zip`) — phpMyAdmin imports zipped
+> SQL directly.
+
+---
+
+## 4. Configure `.env`
+
+In **File Manager**, copy `.env.example` to `.env` (right-click → Copy, then
+Rename), then right-click `.env` → **Edit** and set:
+
+```ini
+CI_ENV=production
+
+VP_BASE_URL=https://yourdomain.com
+
+VP_DB_HOST=localhost
+VP_DB_PORT=3306
+VP_DB_NAME=myaccount_panel
+VP_DB_USER=myaccount_panel
+VP_DB_PASS=the-password-you-set
+
+VP_ENCRYPTION_KEY=32-or-more-random-characters
+VP_AUTH_SECRET=another-32-or-more-random-characters
+```
+
+Save.
+
+* `VP_ENCRYPTION_KEY` protects provider API keys, TOTP secrets and gift card
+  codes stored in the database. The panel refuses to start in production while
+  it is empty, shorter than 32 characters, or still an example value.
+* `VP_AUTH_SECRET` signs password-reset and email-verification links and
+  session tokens.
+* Generate them anywhere that produces long random strings — a password
+  manager is fine. If you have a shell handy, `openssl rand -base64 32`.
+
+Optional, and all documented inline in `.env.example`: mail transport
+(`VP_MAIL_*`), payment gateway keys, fulfilment provider credentials, Redis,
+S3 storage, session/cache tuning.
+
+---
+
+## 5. Verify the deployment (one page, in the browser)
+
+Visit `https://yourdomain.com/deploy-verify.php`.
+
+It checks, and names the exact fix for anything red:
+
+- PHP version and required extensions (`mysqli`, `mbstring`, `curl`,
+  `openssl`, `bcmath`, `json` + recommended ones)
+- the CodeIgniter system path — resolved automatically from `system/` or
+  `vendor/codeigniter/framework/system`, whichever the upload produced
+- `vendor/autoload.php` (bundled fallback or full composer install)
+- writable runtime directories (with real write probes, not guesses)
+- `.env` — required values present, secrets non-default, https base URL
+- database credentials **and a live connection**, including whether the
+  `marvysocials.sql` import actually ran (table count)
+
+**Delete `deploy-verify.php` when everything is green** — File Manager →
+right-click → Delete. (Or set `VP_VERIFY_DISABLE=1` in `.env` to disable it
+without deleting.) It can also run from a shell: `php deploy-verify.php`
+exits 0/1, so monitoring can gate on it.
+
+---
+
+## 6. Open the site
+
+Visit `https://yourdomain.com`.
+
+The homepage should render. For a **new empty database**, create the first
+administrator as follows:
+
+1. Generate a high-entropy secret (for example, 32 random bytes encoded as
+   hex) and set `VP_SETUP_TOKEN` in the server's `.env`. Keep it private.
+2. Visit `https://yourdomain.com/setup`. Enter the token in the form, together
+   with the new administrator's username, email and password (12 characters
+   minimum). Never put the token in a URL.
+3. Remove `VP_SETUP_TOKEN` from `.env` after successful setup and sign in at
+   `https://yourdomain.com/admin/login`.
+
+The setup form creates a Super Admin only when no staff account exists. It
+does not modify existing administrators. The staff count is the only gate, so
+if every staff account is ever removed the form reopens for the operator who
+holds `VP_SETUP_TOKEN`; a previously completed setup does not lock you out.
+If one exists, use staff sign-in or `/forgot-password` instead. The database
+import contains no default accounts. **Older releases shipped publicly known
+passwords**: if you imported an older release, immediately rotate those
+credentials or disable the unused accounts; this update will not do so for you.
+Do not import a fresh database over existing production data.
+
+---
+
+## Folder permissions
+
+The application creates its own runtime directories on the first request, and
+the package already contains them. You only need this section if something is
+not writable — the deployment checks and the error log will say so.
+
+**cPanel → File Manager → select the folder → Permissions:**
+
+| Folder | What is in it | Permissions |
+| --- | --- | --- |
+| `storage/logs/` | application log | 755 (or 775) |
+| `storage/cache/` | cached settings and templates | 755 (or 775) |
+| `storage/cache/sessions/` | logged-in sessions | 755 (or 775) |
+| `assets/uploads/` | uploaded images and PDFs | 755 (or 775) |
+| `application/cache/` | CodeIgniter cache | 755 (or 775) |
+
+Files 644, directories 755. Some hosts run PHP as a different user than the one
+that owns the files; those need 775 on the five folders above. Nothing needs
+777, and nothing needs `chmod`, `chown` or `find` from a shell.
+
+Each of those directories ships with its own `.htaccess`, so logs, caches and
+sessions are not readable over HTTP even though they sit inside the document
+root. `assets/uploads/` is deliberately different: it is served to browsers,
+but with PHP execution switched off.
+
+---
+
+## Migrating an existing panel to a new cPanel account
+
+Same five steps, with two differences.
+
+**Export from the old account:**
+
+1. **File Manager** → select the application folder → **Compress** → download
+   the zip. (Or reuse `application-deployment.zip` — the files are the same;
+   only `.env`, `assets/uploads/` and the database carry your data.)
+2. **phpMyAdmin** → select the old database → **Export** → *Quick*, format
+   **SQL** → Go. Save the `.sql` file.
+3. Open the old `.env` and copy the values of `VP_ENCRYPTION_KEY` (or
+   `ENCRYPTION_KEY`) and `VP_AUTH_SECRET` (or `APP_KEY`).
+
+**On the new account:**
+
+4. Upload and extract the files (step 1), and upload the contents of
+   `assets/uploads/` if you compressed the app without them.
+5. Create the new database and user (step 2).
+6. Import **your exported dump**, not `database/marvysocials.sql` — your dump
+   already contains the schema *and* your live data.
+7. Edit `.env` (step 4) with the **new** database name/user/password and the
+   new domain, and paste the **old** `VP_ENCRYPTION_KEY` and `VP_AUTH_SECRET`
+   back in unchanged.
+8. Open the domain. Existing users, including the administrator, log in with
+   the passwords they already had.
+
+> **The secrets must travel with the database.** Provider API keys, TOTP
+> secrets and gift card codes are encrypted at rest with `VP_ENCRYPTION_KEY`.
+> Generate a new key on the new server and those rows become undecryptable —
+> the panel will run, but every stored provider credential has to be re-entered
+> and every user with two-factor authentication has to re-enrol.
+
+Nothing about a migration requires new secrets, a new installer run, or a
+terminal.
+
+---
+
+## Background jobs (recommended)
+
+Drip-feed orders, subscription renewals, provider status polling, payment
+reconciliation, email delivery and automatic display-currency rates all run as
+background jobs. The panel also has a built-in site-traffic auto-run heartbeat:
+if cron has not been installed yet, ordinary page loads run due jobs a few at a
+time so an active site keeps moving. A real crontab is still recommended because
+it runs on schedule even when nobody visits.
+
+**cPanel → Cron Jobs** → *Add New Cron Job*. The easiest path is to copy the
+current block from **Admin → System → Cron jobs**, which is generated from the
+same schedule table the app uses. If you add jobs manually, include the currency
+rate refresh too (adjust the PHP path and the application path to your account —
+cPanel shows the correct `php` binary under *Select PHP Version*):
+
+| Common settings | Command |
+| --- | --- |
+| Once per minute | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron dripfeed >/dev/null 2>&1` |
+| Every 2 minutes | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron order_status >/dev/null 2>&1` |
+| Every 5 minutes | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron email_queue >/dev/null 2>&1` |
+| Every 5 minutes | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron payment_reconciliation >/dev/null 2>&1` |
+| Every 5 minutes | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron subscriptions >/dev/null 2>&1` |
+| Hourly | `cd /home/myaccount/public_html && /usr/local/bin/php index.php cron currency_rates >/dev/null 2>&1` |
+
+`cron/crontab.example` in the package lists every available job with its
+recommended schedule, and `php index.php cron` prints the same list.
+
+If a host cannot run a PHP command but can call a URL from a scheduler, set
+`VP_CURRENCY_RATE_WEBHOOK_SECRET` and call
+`https://yourdomain.com/webhook/currency-rates?secret=...` for the currency
+rate refresh only. That endpoint is optional, signed, and runs the same locked
+`currency_rates` worker as the crontab/Admin button.
+
+This is the only place a PHP command line appears anywhere in this document,
+it is entered through a cPanel form rather than a terminal, and the panel
+serves traffic correctly without it because the auto-run heartbeat is on by
+default.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| “CodeIgniter framework files are missing” / “system folder path does not appear to be set correctly” | The upload was cut short — `system/` (and/or `vendor/`) is incomplete | Re-upload the zip and re-extract. The package ships the framework as ordinary files in **both** auto-detected locations, so no symlink or `composer install` is ever needed. `/deploy-verify.php` confirms the fix. |
+| “The panel is not configured yet” | `.env` missing a required value | The page names it. Edit `.env` in File Manager. |
+| Blank page / HTTP 500 | Usually a permissions problem | Set the five folders above to 755/775; check `storage/logs/log-*.php`. |
+| “Unable to connect to your database server” | Wrong `VP_DB_*` values, or the user is not assigned to the database | cPanel → MySQL Databases → *Add User To Database* → ALL PRIVILEGES. |
+| Homepage loads but every link 404s | `.htaccess` was not extracted (File Manager hides dotfiles by default) | File Manager → Settings → *Show Hidden Files*, confirm `.htaccess` exists next to `index.php`. |
+| Login form reloads without an error | Session cookies are `Secure` but the site is on plain http | Install the free certificate in cPanel → SSL/TLS Status, then set `VP_BASE_URL=https://…`. |
+| Admin login works but every `/admin` page bounces to Security | `admin_mfa_required` is on and the account has no authenticator yet | Turn the setting off in Admin → Settings, or update `admin_mfa_required=0` in the `settings` table. |
+| Provider keys stopped working after a move | `VP_ENCRYPTION_KEY` changed | Restore the old key in `.env`. |
+| Uploaded images 404 | `assets/uploads/` missing or not writable | Create it in File Manager and set 755/775. |
+
+The application log is `storage/logs/log-YYYY-MM-DD.php`, readable from File
+Manager.
+
+---
+
+## What each file in the package is for
+
+```
+application-deployment.zip
+├── index.php                 front controller — reads .env, boots the app
+├── .htaccess                 clean URLs + denies application/, system/, database/, dotfiles
+├── .env.example              copy to .env and edit; the only configuration
+├── deploy-verify.php         browser diagnostics — delete after a green report
+├── README-DEPLOYMENT.txt     this guide, condensed to one screen
+├── application/              controllers, models, views, libraries, config
+├── system/                   CodeIgniter 3.1.13, REAL files (no symlink — works everywhere)
+├── vendor/                   codeigniter/framework + fallback autoloader;
+│   │                         full composer dependencies when built after composer install
+│   └── codeigniter/framework/system/   ← the second path index.php auto-detects
+├── assets/                   css, js, images, uploads/ (writable)
+├── storage/                  logs/ and cache/ (writable, pre-guarded)
+├── cron/                     crontab example for cPanel → Cron Jobs
+└── database/
+    └── marvysocials.sql           the complete database: schema + data + accounts
+```
+
+`index.php` auto-detects the framework in `system/` first and
+`vendor/codeigniter/framework/system` second — both always exist in the
+package, as ordinary files, so no composer install and no symlink support is
+needed at the destination. The remaining composer packages (S3 storage,
+Redis, payment SDKs) stay optional feature flags: the request path never
+requires them.
+
+---
+
+## For maintainers: rebuilding the package
+
+The zip is a build artifact (GitHub Actions → Artifacts, or GitHub Releases
+when a `v*` tag is pushed). After changing application code, a migration or
+the core seed, rebuild it:
+
+```bash
+php tools/build_production_sql.php          # regenerate database/marvysocials.sql
+bash tools/build_deployment_package.sh      # regenerate application-deployment.zip
+bash tools/verify_deployment_package.sh     # extract it into a scratch account and prove it boots
+```
+
+`CpanelDeploymentTest` fails when the committed zip no longer matches the tree:
+its staleness check compares every packaged application file (views, layouts,
+assets, config, controllers, models, libraries, database dump, runtime
+guards) hash-for-hash against the working tree, not just `marvysocials.sql` and
+`index.php`. CI runs all three of the above plus a real MySQL import of
+`database/marvysocials.sql`.

@@ -1,0 +1,919 @@
+<?php
+/*
+ * Loaded two ways: by CI3's helper autoloader (BASEPATH defined) and by
+ * composer's autoload "files" BEFORE index.php defines BASEPATH. A plain
+ * `defined('BASEPATH') OR exit` here therefore killed every request the
+ * moment a real composer vendor/ was present. Only block the case the guard
+ * exists for: this file being executed directly as the main script.
+ */
+if (!defined('BASEPATH')
+    && isset($_SERVER['SCRIPT_FILENAME'])
+    && realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) {
+    exit('No direct script access allowed');
+}
+
+if (!function_exists('csrf')) {
+    /**
+     * Hidden CSRF input for hand-written <form> blocks.
+     *
+     * Many admin views emit `<?=csrf()?>` inside a <form method="post"> that
+     * is not built with form_open(); without this helper every such POST is
+     * rejected by the CSRF filter and the form "does nothing". Returns the
+     * markup, or an empty string when the security helper is unavailable.
+     */
+    function csrf() {
+        $ci =& get_instance();
+        if (!isset($ci->security)) {
+            $ci->load->library('security');
+        }
+        $name = $ci->security->get_csrf_token_name();
+        $hash = $ci->security->get_csrf_hash();
+        return '<input type="hidden" name="'.htmlspecialchars($name, ENT_QUOTES).'"'
+            .' value="'.htmlspecialchars($hash, ENT_QUOTES).'">';
+    }
+}
+
+if (!function_exists('marvy_public_id')) {    function marvy_public_id(){
+        if (class_exists(\Robbins\Ulid\Ulid::class)) return (string)\Robbins\Ulid\Ulid::generate();
+        if (class_exists(\Ramsey\Uuid\Uuid::class)) return \Ramsey\Uuid\Uuid::uuid4()->toString();
+        return bin2hex(random_bytes(13));
+    }
+}
+if (!function_exists('marvy_site_name')) {
+    /**
+     * Single source of truth for the public-facing brand name.
+     *
+     * Reads application/config/marvy.php -> public_name so a deployment can
+     * change the marketing site without touching dozens of views. Falls back to
+     * the internal product name, then to the codebase default.
+     */
+    function marvy_site_name(){
+        static $name = null;
+        if ($name !== null) return $name;
+        $name = 'Active Digital Hub';
+        if (function_exists('get_instance')) {
+            $ci = @get_instance();
+            if ($ci && isset($ci->config)) {
+                $cfg = $ci->config->item('marvy');
+                if (is_array($cfg) && !empty($cfg['public_name'])) {
+                    $name = (string)$cfg['public_name'];
+                } elseif (is_array($cfg) && !empty($cfg['name'])) {
+                    $name = (string)$cfg['name'];
+                }
+            }
+        }
+        return $name;
+    }
+}
+
+if (!function_exists('marvy_site_tagline')) {
+    /**
+     * Public-facing tagline, same config-driven source as marvy_site_name().
+     */
+    function marvy_site_tagline(){
+        static $tagline = null;
+        if ($tagline !== null) return $tagline;
+        $tagline = 'Prepaid commerce for social media, VTU, virtual numbers, identity, gift cards and digital goods';
+        if (function_exists('get_instance')) {
+            $ci = @get_instance();
+            if ($ci && isset($ci->config)) {
+                $cfg = $ci->config->item('marvy');
+                if (is_array($cfg) && !empty($cfg['public_tagline'])) {
+                    $tagline = (string)$cfg['public_tagline'];
+                } elseif (is_array($cfg) && !empty($cfg['tagline'])) {
+                    $tagline = (string)$cfg['tagline'];
+                }
+            }
+        }
+        // Admin → Settings `site_tagline` overrides the config default.
+        if (function_exists('marvy_brand_setting')) {
+            $setting = marvy_brand_setting('site_tagline');
+            if ($setting !== null && $setting !== '') $tagline = (string)$setting;
+        }
+        return $tagline;
+    }
+}
+
+if (!function_exists('marvy_brand_logo')) {
+    /**
+     * Public logo with the configured brand name baked in at render time.
+     *
+     * The SVG partial accepts variant/height; this helper keeps the header,
+     * footer and auth shell from each hardcoding a different asset path.
+     */
+    function marvy_brand_logo($variant = 'horizontal', $height = 32){
+        // Canonical Active Digital Hub mark set. Variant-first, then a safe fallback
+        // to the primary horizontal logo so a missing asset can't white-screen.
+        $map = array(
+            'icon'       => 'logo-icon.svg',
+            'dark'       => 'logo-dark.svg',
+            'horizontal' => 'logo-horizontal.svg',
+            'full'       => 'logo.svg',
+        );
+        $file = $map[$variant] ?? $map['horizontal'];
+        $path = FCPATH.'assets/brand/'.$file;
+        if (!is_file($path)) $file = $map['horizontal'];
+        return base_url('assets/brand/'.$file);
+    }
+}
+
+if (!function_exists('marvy_brand_setting')) {
+    /**
+     * Read a branding setting (brand_logo_url, brand_favicon_url, …) saved
+     * through Admin → Appearance. Returns NULL when unset or the database is
+     * unavailable, so callers always have a bundled fallback.
+     */
+    function marvy_brand_setting($key, $default = null) {
+        static $cache = array();
+        if (array_key_exists($key, $cache)) {
+            return $cache[$key] !== null ? $cache[$key] : $default;
+        }
+        $cache[$key] = null;
+        try {
+            if (function_exists('get_instance')) {
+                $ci =& get_instance();
+                if ($ci && isset($ci->db) && is_object($ci->db) && !empty($ci->db->conn_id)) {
+                    $ci->load->model('Setting_model');
+                    $v = $ci->Setting_model->get($key);
+                    if ($v !== null && $v !== '') $cache[$key] = $v;
+                }
+            }
+        } catch (Throwable $e) { $cache[$key] = null; }
+        return $cache[$key] !== null ? $cache[$key] : $default;
+    }
+}
+
+if (!function_exists('marvy_social_links')) {
+    /**
+     * The social channels rendered in the footer: channel => link URL.
+     *
+     * Each channel is one settings row (social_facebook_url, …) editable
+     * under Admin → Settings → Social channels. A channel can be in one of
+     * three states, and the footer does a different thing with each:
+     *
+     *   - a stored URL  → the button opens it in a new tab;
+     *   - no row yet    → the platform's home page, so a fresh install (or a
+     *                     deployment that skipped the migration) still shows
+     *                     all seven buttons instead of a half-empty row;
+     *   - an empty row  → the button is hidden. Clearing the field in admin
+     *                     is the documented way to drop a channel the
+     *                     operator does not use.
+     *
+     * Only channels with a non-empty URL are returned. Reads go through
+     * Setting_model::all(), which is memoised per request, so calling this
+     * from the footer costs no extra round-trip — and the database guard is
+     * the same one marvy_brand_setting() uses, so a database that is not
+     * reachable simply gets the shipped defaults.
+     */
+    function marvy_social_links() {
+        $defaults = array(
+            'facebook'  => 'https://www.facebook.com/',
+            'instagram' => 'https://www.instagram.com/',
+            'whatsapp'  => 'https://www.whatsapp.com/',
+            'x'         => 'https://x.com/',
+            'linkedin'  => 'https://www.linkedin.com/',
+            'telegram'  => 'https://t.me/',
+            'youtube'   => 'https://www.youtube.com/',
+        );
+        $stored = array();
+        try {
+            if (function_exists('get_instance')) {
+                $ci =& get_instance();
+                if ($ci && isset($ci->db) && is_object($ci->db) && !empty($ci->db->conn_id)) {
+                    $ci->load->model('Setting_model');
+                    $all = $ci->Setting_model->all();
+                    foreach ($defaults as $channel => $fallback) {
+                        $key = 'social_'.$channel.'_url';
+                        if (array_key_exists($key, $all)) $stored[$channel] = $all[$key];
+                    }
+                }
+            }
+        } catch (Throwable $e) { /* fall back to the shipped defaults */ }
+
+        $out = array();
+        foreach ($defaults as $channel => $fallback) {
+            if (!array_key_exists($channel, $stored)) { $out[$channel] = $fallback; continue; }
+            $url = $stored[$channel] === null ? '' : trim((string)$stored[$channel]);
+            if ($url !== '') $out[$channel] = $url;
+        }
+        return $out;
+    }
+}
+
+if (!function_exists('marvy_default_theme')) {
+    /**
+     * The site-wide default theme: 'system', 'light' or 'dark'.
+     *
+     * Reads Admin → Settings `default_theme` (seeded 'system') and falls back to
+     * 'system', which follows the visitor's OS preference. Individual visitors
+     * can override it in their browser (stored in localStorage) via the theme
+     * toggle; the initial paint uses this value so there is no flash.
+     */
+    function marvy_default_theme(){
+        static $theme = null;
+        if ($theme !== null) return $theme;
+        $theme = 'system';
+        if (function_exists('marvy_brand_setting')) {
+            $v = marvy_brand_setting('default_theme');
+            if ($v !== null && $v !== '') {
+                $v = strtolower(trim((string)$v));
+                if (in_array($v, array('system', 'light', 'dark'), true)) $theme = $v;
+            }
+        }
+        return $theme;
+    }
+}
+
+if (!function_exists('marvy_base_currency')) {
+    /**
+     * The panel's base currency code.
+     *
+     * Every wallet, order and service transaction is denominated in this.
+     * Reads application/config/marvy.php so a deployment can redenominate in
+     * one place; falls back to NGN when the config is unavailable (CLI helpers,
+     * early bootstrap) rather than guessing a foreign currency.
+     */
+    function marvy_base_currency(){
+        // Memoised in a global rather than a function static so the request
+        // that redenominates the panel can clear it (see
+        // marvy_forget_base_currency) and re-render in the new currency.
+        if (isset($GLOBALS['__marvy_base_currency'])) return $GLOBALS['__marvy_base_currency'];
+
+        // Config is the floor, not the authority. It answers during early
+        // bootstrap, CLI helpers and any request where the database is not
+        // reachable — a price must never fail to render because of this.
+        $code = 'NGN';
+        if (function_exists('get_instance')) {
+            $ci = @get_instance();
+            if ($ci && isset($ci->config)) {
+                $cfg = $ci->config->item('marvy');
+                if (is_array($cfg) && !empty($cfg['base_currency'])) {
+                    $code = strtoupper($cfg['base_currency']);
+                }
+            }
+        }
+
+        // The `currencies.is_base` row is the authority once an operator has
+        // redenominated through Admin → Settings. That switch converts every
+        // stored amount in the same transaction that moves this flag (see
+        // BaseCurrencyService), so trusting it here is what makes the change
+        // actually take effect instead of saving a value nothing reads.
+        if (function_exists('get_instance')) {
+            try {
+                $ci = @get_instance();
+                if ($ci && isset($ci->db) && is_object($ci->db)) {
+                    $row = $ci->db->select('code')->where('is_base', 1)->limit(1)
+                        ->get('currencies')->row();
+                    if ($row && !empty($row->code)) $code = strtoupper($row->code);
+                }
+            } catch (Throwable $e) {
+                // Keep the config value: an unreadable table is not a reason
+                // to start denominating the panel in something else.
+            }
+        }
+        return $GLOBALS['__marvy_base_currency'] = $code;
+    }
+
+    /**
+     * Forget the memoised base currency.
+     *
+     * Only meaningful inside the request that redenominates the panel: every
+     * later request reads it fresh. Without this, the screen that performed
+     * the switch would still render the old currency it had already cached.
+     */
+    function marvy_forget_base_currency(){
+        unset($GLOBALS['__marvy_base_currency']);
+    }
+}
+if (!function_exists('marvy_money')) {
+    function marvy_money($amount, $currency=NULL){
+        if ($currency === NULL) $currency = marvy_base_currency();
+        $formatted = number_format((float)$amount, 2, '.', ',');
+        // Admin → Settings `currency_display` (symbol|code). `code` prints
+        // "NGN 1,234.56" instead of "₦1,234.56". Fail open to the symbol.
+        $display = 'symbol';
+        if (function_exists('marvy_brand_setting')) {
+            $setting = marvy_brand_setting('currency_display');
+            if ($setting !== null && strtolower(trim((string)$setting)) === 'code') $display = 'code';
+        }
+        if ($display === 'code') return strtoupper($currency).' '.$formatted;
+        $sym = array('NGN'=>'₦','USD'=>'$','EUR'=>'€','GBP'=>'£','INR'=>'₹','BRL'=>'R$')[strtoupper($currency)] ?? $currency.' ';
+        return $sym . $formatted;
+    }
+}
+if (!function_exists('marvy_vtu_currency')) {
+    /**
+     * VTU products (airtime, data, cable TV, electricity and exam PINs) are
+     * Nigerian carrier/utility variations priced and billed in Naira (NGN)
+     * regardless of the panel's accounting or browsing currency.
+     */
+    function marvy_vtu_currency(){
+        return 'NGN';
+    }
+}
+if (!function_exists('marvy_naira')) {
+    /**
+     * Format an amount unconditionally in Nigerian Naira (₦).
+     */
+    function marvy_naira($amount){
+        return '₦'.number_format((float)$amount, 2, '.', ',');
+    }
+}
+if (!function_exists('marvy_display_money')) {
+    /**
+     * A base-currency amount, converted and formatted for browsing in the
+     * admin-configured display currency (Admin → Currencies).
+     *
+     * This is a *browsing aid only* — it never changes what is actually
+     * charged. Checkout, wallets, orders, refunds and payouts all continue to
+     * settle in marvy_base_currency() exactly as before; this exists so a
+     * catalogue page can show "≈ $12.50" next to the real ₦20,000 price
+     * without any settlement code needing to know the difference.
+     *
+     * Fails open to marvy_money() (the base-currency formatter) if
+     * CurrencyService or its dependencies are unavailable — a broken
+     * conversion path must never break the price itself from rendering.
+     *
+     * @param string $amount base-currency amount
+     * @param string|null $to target currency code; defaults to the configured display currency
+     */
+    function marvy_display_money($amount, $to = null) {
+        static $service = null;
+        if ($service === null && function_exists('get_instance')) {
+            try {
+                $ci =& get_instance();
+                $ci->load->library('CurrencyService');
+                // A loader that no-ops (test doubles) leaves the property
+                // unset; reading it blind warns where try/catch cannot help.
+                $service = isset($ci->currencyservice) ? $ci->currencyservice : false;
+            } catch (Throwable $e) {
+                $service = false;
+            }
+        }
+        if (!$service) return marvy_money($amount);
+        try {
+            return $service->display($amount, $to);
+        } catch (Throwable $e) {
+            return marvy_money($amount);
+        }
+    }
+}
+
+if (!function_exists('marvy_to_base_money')) {
+    /**
+     * Convert a stored amount from its source currency into the panel's
+     * accounting currency. Unlike the display helper, a missing rate returns
+     * NULL so checkout code and product views do not quietly treat "$1" as
+     * "₦1".
+     *
+     * @param string|float|int $amount
+     * @param string|null      $from source currency code; NULL means base
+     * @return string|null base-currency amount with 8dp, or NULL when no rate exists
+     */
+    function marvy_to_base_money($amount, $from = null) {
+        $from = strtoupper((string)($from ?: marvy_base_currency()));
+        if ($from === marvy_base_currency()) return number_format((float)$amount, 8, '.', '');
+        if (!is_numeric($amount)) return null;
+
+        $service = false;
+        if (function_exists('get_instance')) {
+            try {
+                $ci =& get_instance();
+                if ($ci && !isset($ci->currencyservice) && isset($ci->load)) {
+                    $ci->load->library('CurrencyService');
+                }
+                $service = ($ci && isset($ci->currencyservice)) ? $ci->currencyservice : false;
+            } catch (Throwable $e) {
+                $service = false;
+            }
+        }
+        if (!$service || !method_exists($service, 'to_base')) return null;
+
+        try {
+            $converted = $service->to_base($amount, $from);
+            return $converted === null ? null : (string)$converted;
+        } catch (Throwable $e) {
+            return null;
+        }
+    }
+}
+
+if (!function_exists('marvy_display_currency')) {
+    /**
+     * The currency code the catalogue is currently browsed in (Admin →
+     * Currencies → default display currency). Falls back to the base currency
+     * whenever CurrencyService cannot answer — a price must always render.
+     */
+    function marvy_display_currency() {
+        // Memoised in a global rather than a function static so a request that
+        // changes the currency configuration can clear it (see
+        // marvy_forget_display_currency) — and so the test suite can drive
+        // more than one currency world in a single process.
+        if (isset($GLOBALS['__marvy_display_currency'])) return $GLOBALS['__marvy_display_currency'];
+        $code = marvy_base_currency();
+        if (!function_exists('get_instance')) return $code;
+        try {
+            $ci =& get_instance();
+            $ci->load->library('CurrencyService');
+            // load->library() succeeding does not guarantee the property is
+            // there (a test double, or a loader that resolved it under another
+            // name); reading it blind raises a warning try/catch cannot see.
+            if (isset($ci->currencyservice)) {
+                $code = strtoupper((string)$ci->currencyservice->display_code());
+            }
+        } catch (Throwable $e) {
+            $code = marvy_base_currency();
+        }
+        return $GLOBALS['__marvy_display_currency'] = $code;
+    }
+}
+
+if (!function_exists('marvy_forget_display_currency')) {
+    /**
+     * Drop the memoised display currency after the configuration changes.
+     *
+     * The screen that switches the default display currency (or disables the
+     * one in force) would otherwise keep rendering the currency it cached at
+     * the top of the same request.
+     */
+    function marvy_forget_display_currency(){
+        unset($GLOBALS['__marvy_display_currency']);
+        if (class_exists('Currency_model')) Currency_model::forget();
+    }
+}
+
+if (!function_exists('marvy_display_rate')) {
+    /**
+     * Units of the display currency per 1 unit of the base currency.
+     *
+     * This is the single number every catalogue surface (and the JavaScript
+     * that recalculates a live total as the customer types a quantity) must
+     * agree on, so a converted price never drifts between the card, the
+     * product page and the order form. Returns '1.00000000' when the display
+     * currency is the base currency or no usable rate exists.
+     */
+    function marvy_display_rate($to = null) {
+        $to = strtoupper((string)($to ?: marvy_display_currency()));
+        if ($to === marvy_base_currency()) return '1.00000000';
+        try {
+            $ci =& get_instance();
+            $ci->load->model('Currency_model');
+            $row = $ci->Currency_model->find($to);
+            if ($row && (int)$row->is_active === 1 && bccomp((string)$row->exchange_rate, '0', 8) > 0) {
+                return (string)$row->exchange_rate;
+            }
+        } catch (Throwable $e) {
+            // fall through to the identity rate
+        }
+        return '1.00000000';
+    }
+}
+
+if (!function_exists('marvy_pay_currency')) {
+    /**
+     * The currency a customer is actually CHARGED in.
+     *
+     * This is the default display currency — the one the operator chose in
+     * Admin → Currencies and the one every price on the site is quoted in —
+     * not the base/accounting currency. Asking a Nigerian customer looking at
+     * ₦ prices to hand a gateway a USD amount is the bug this exists to stop:
+     * payment methods are denominated in what the customer sees.
+     *
+     * Settlement is unaffected. The wallet is still credited in the base
+     * currency; PaymentService converts at the rate pinned on the deposit.
+     */
+    function marvy_pay_currency() {
+        return marvy_display_currency();
+    }
+}
+
+if (!function_exists('marvy_rate_line')) {
+    /**
+     * The human sentence for a conversion rate: "$1 = ₦1,328.00".
+     *
+     * Every surface that quotes a converted amount has to show the customer
+     * the rate it used, or the number is unauditable — this is the one place
+     * that sentence is built so the wallet, Add Funds and the deposit page
+     * cannot disagree about its wording or its rounding.
+     *
+     * @param string      $rate units of $pay per 1 unit of $base
+     * @param string|null $pay  the charge currency (default: pay currency)
+     * @param string|null $base the accounting currency (default: base)
+     */
+    function marvy_rate_line($rate = null, $pay = null, $base = null) {
+        $base = strtoupper((string)($base ?: marvy_base_currency()));
+        $pay  = strtoupper((string)($pay  ?: marvy_pay_currency()));
+        if ($rate === null) $rate = marvy_display_rate($pay);
+        if (!is_numeric($rate) || (float)$rate <= 0) return '';
+        // 1 unit of base, expressed in the charge currency. Shown at the
+        // currency's own precision so a JPY rate does not read "¥150.00".
+        return marvy_money(1, $base).' = '.marvy_money($rate, $pay);
+    }
+}
+
+if (!function_exists('marvy_currency_symbol')) {
+    /**
+     * The bare symbol (or code prefix) a currency renders with.
+     *
+     * Views that hand a currency to JavaScript need the symbol on its own, and
+     * deriving it by stripping digits out of marvy_money(0, …) breaks on a
+     * code-style display ("NGN 0.00" → "NGN"), on thousands separators, and on
+     * any symbol containing a digit. Asking the formatter directly keeps the
+     * client-side running total spelled exactly like the server-rendered one.
+     */
+    function marvy_currency_symbol($code = null) {
+        $code = strtoupper((string)($code ?: marvy_base_currency()));
+        // marvy_money() renders "<prefix>0.00" in both symbol and code mode,
+        // so the prefix is whatever precedes the formatted zero.
+        $rendered = marvy_money(0, $code);
+        $zero = number_format(0, 2, '.', ',');
+        $at = strrpos($rendered, $zero);
+        return $at === false ? $code.' ' : substr($rendered, 0, $at);
+    }
+}
+
+if (!function_exists('marvy_price')) {
+    /**
+     * A catalogue price, rendered the way every product surface should render
+     * one: the settlement amount in the base currency, plus the converted
+     * "≈" estimate when the operator has put the catalogue in a different
+     * display currency.
+     *
+     * Why a helper instead of per-view markup: an exchange-rate change in
+     * Admin → Currencies has to reach *every* place a product price appears —
+     * services list, service detail, shop grid, product page, order form —
+     * or customers see two different prices for the same thing. Centralising
+     * it means there is exactly one conversion rule to change, and it reads
+     * live from the currency row, so a manual NGN/USD rate update is visible
+     * on the next page render with no cache to bust.
+     *
+     * The base amount stays first and unmodified on purpose: the wallet is
+     * charged in the base currency, so that is the real price and the
+     * conversion is explicitly labelled an estimate.
+     *
+     * @param string      $amount source amount; base currency unless $source_currency is passed
+     * @param string|null $suffix optional unit label, e.g. '/ 1k'
+     * @param bool        $approx render the converted estimate (false = base only)
+     * @param string|null $source_currency currency the source amount is stored in
+     */
+    function marvy_price($amount, $suffix = null, $approx = true, $source_currency = null) {
+        $source_currency = strtoupper((string)($source_currency ?: marvy_base_currency()));
+        if ($source_currency !== marvy_base_currency()) {
+            $base_amount = marvy_to_base_money($amount, $source_currency);
+            if ($base_amount === null) {
+                return '<span class="badge badge-warning" title="No usable '.htmlspecialchars($source_currency)
+                    .' to '.htmlspecialchars(marvy_base_currency()).' rate is configured">Price unavailable</span>';
+            }
+            $amount = $base_amount;
+        }
+
+        $base_html = htmlspecialchars(marvy_money($amount));
+        if ($suffix) {
+            $base_html .= ' <span class="muted" style="font-weight:400;font-size:.75rem">'
+                .htmlspecialchars($suffix).'</span>';
+        }
+        if (!$approx) return $base_html;
+
+        $to = marvy_display_currency();
+        if ($to === marvy_base_currency()) return $base_html;
+
+        $converted = marvy_display_money($amount, $to);
+        if ($converted === marvy_money($amount)) return $base_html;
+
+        return $base_html.'<div class="hint marvy-approx" style="margin:0" title="Estimate at the current '
+            .htmlspecialchars($to).' rate — your wallet is always charged in '
+            .htmlspecialchars(marvy_base_currency()).'">≈ '.htmlspecialchars($converted).'</div>';
+    }
+}
+
+if (!function_exists('marvy_price_text')) {
+    /**
+     * Plain-text catalogue price with converted estimate for select dropdowns,
+     * option tags and non-HTML contexts.
+     *
+     * @param string      $amount source amount; base currency unless $source_currency is passed
+     * @param string|null $suffix optional unit label, e.g. '/ 1k'
+     * @param bool        $approx include converted estimate when display currency differs
+     * @param string|null $source_currency currency the source amount is stored in
+     */
+    function marvy_price_text($amount, $suffix = null, $approx = true, $source_currency = null) {
+        $source_currency = strtoupper((string)($source_currency ?: marvy_base_currency()));
+        if ($source_currency !== marvy_base_currency()) {
+            $base_amount = marvy_to_base_money($amount, $source_currency);
+            if ($base_amount === null) return 'Price unavailable';
+            $amount = $base_amount;
+        }
+
+        $base = marvy_money($amount) . ($suffix ? ' '.$suffix : '');
+        if (!$approx) return $base;
+
+        $to = marvy_display_currency();
+        if ($to === marvy_base_currency()) return $base;
+
+        $converted = marvy_display_money($amount, $to);
+        if ($converted === marvy_money($amount)) return $base;
+
+        return $base . ' (≈ ' . $converted . ($suffix ? ' '.$suffix : '') . ')';
+    }
+}
+
+if (!function_exists('marvy_request_id')) {
+    function marvy_request_id(){ return bin2hex(random_bytes(8)); }
+}
+
+if (!function_exists('csp_nonce')) {
+    /**
+     * The current request's Content-Security-Policy nonce.
+     *
+     * Set by MY_Controller::send_security_headers(). Returns '' outside a web
+     * request (CLI, tests) so views degrade rather than fatal.
+     */
+    function csp_nonce() {
+        return isset($GLOBALS['__marvy_csp_nonce']) ? $GLOBALS['__marvy_csp_nonce'] : '';
+    }
+}
+
+if (!function_exists('csp_nonce_attr')) {
+    /**
+     * Ready-to-print nonce attribute for an inline <script> tag:
+     *   <script <?=csp_nonce_attr()?>> ... </script>
+     *
+     * Without this the script is silently dropped by the browser, since the
+     * policy does not allow 'unsafe-inline'.
+     */
+    function csp_nonce_attr() {
+        $nonce = csp_nonce();
+        return $nonce === '' ? '' : 'nonce="'.htmlspecialchars($nonce, ENT_QUOTES).'"';
+    }
+}
+
+if (!function_exists('marvy_feature_enabled')) {
+    /**
+     * Whether a product-module switch under Admin → Settings → Feature flags
+     * is on, with a documented default when the row/table is unavailable.
+     *
+     * Every flag seeded in Core_seeder::seed_feature_flags() must have a
+     * caller here or in a controller/library it gates — a switch nobody
+     * reads is worse than no switch (see SettingsService's class doc).
+     * Centralising the lookup also means turning a module off always fails
+     * the same way (feature unavailable), rather than one flag 404ing and
+     * another silently doing nothing.
+     */
+    function marvy_feature_enabled($key, $default = true) {
+        try {
+            $ci =& get_instance();
+            $ci->load->model('Feature_flag_model');
+            // Through the model's per-request memo rather than a point query:
+            // the navigation alone asks about a flag per module, so this ran
+            // nine times per authenticated page load before the page did any
+            // of its own work. A stubbed CI that does not provide the model
+            // falls back to the caller's default, as it did before.
+            if (!isset($ci->Feature_flag_model)) return (bool)$default;
+            $all = $ci->Feature_flag_model->all_flags();
+            if (!array_key_exists($key, $all)) return (bool)$default;
+            return (bool)$all[$key];
+        } catch (Throwable $e) {
+            return (bool)$default;
+        }
+    }
+}
+
+if (!function_exists('env_bool')) {
+    /**
+     * Read a boolean from the environment.
+     *
+     * getenv() returns strings, and every non-empty string is truthy in PHP —
+     * so `(bool)getenv('FLAG')` is TRUE for the literal "false", "0" and "off".
+     * .env.example ships `HTTP_ALLOW_PRIVATE_HOSTS=false`, which under the old
+     * cast silently switched SSRF protection off, and `APP_DEBUG=false`, which
+     * turned on debug logging in production. Anything not recognisably true is
+     * false here.
+     */
+    function env_bool($key, $default = false) {
+        $raw = getenv($key);
+        if ($raw === false || $raw === '') return (bool)$default;
+        return in_array(strtolower(trim($raw)), array('1', 'true', 'yes', 'on'), TRUE);
+    }
+}
+
+if (!function_exists('marvy_load_database')) {
+    /**
+     * Connect to MySQL without killing the request.
+     *
+     * Returns TRUE when $CI->db is usable. A failed connect (wrong .env,
+     * MySQL not imported yet, host down) returns FALSE and leaves no
+     * mysqli warning on the output buffer — those warnings used to become
+     * "headers already sent" on top of the database error page.
+     */
+    function marvy_load_database() {
+        if (!function_exists('get_instance')) {
+            return false;
+        }
+        $CI =& get_instance();
+        if (isset($CI->db) && is_object($CI->db) && !empty($CI->db->conn_id)) {
+            return true;
+        }
+
+        if (!marvy_db_reachable()) {
+            return false;
+        }
+
+        $handler = set_error_handler(function () { return true; });
+        try {
+            $CI->load->database();
+        } catch (Throwable $e) {
+            if ($handler) { set_error_handler($handler); } else { restore_error_handler(); }
+            return false;
+        }
+        if ($handler) { set_error_handler($handler); } else { restore_error_handler(); }
+
+        if (!isset($CI->db) || !is_object($CI->db) || empty($CI->db->conn_id)) {
+            return false;
+        }
+        if (defined('ENVIRONMENT') && ENVIRONMENT !== 'production') {
+            $CI->db->db_debug = true;
+        }
+        return true;
+    }
+
+    /**
+     * Cheap TCP/auth probe so we never let CI's mysqli driver emit warnings.
+     *
+     * The auth half only runs for the mysqli driver. With PDO the application
+     * connects through CI's PDO driver, so doing the probe through mysqli would
+     * fail every install that configured PDO (often because the PHP binary has
+     * no mysqli extension at all) and make a reachable database look down.
+     * For PDO we still verify the port is listening, then let the real driver
+     * own authentication and its own connection errors.
+     */
+    function marvy_db_reachable() {
+        $driver = strtolower((string)(function_exists('env_str') ? env_str('DB_DRIVER', 'mysqli') : 'mysqli'));
+        $host = (string)(function_exists('env_str') ? env_str('DB_HOST', '') : '');
+        $port = (int)(getenv('DB_PORT') ?: 0);
+        $user = (string)(getenv('DB_USER') ?: '');
+        $pass = (string)(getenv('DB_PASSWORD') ?: '');
+        $name = (string)(getenv('DB_NAME') ?: '');
+        // A deployment may carry its connection in a single PDO DSN
+        // (VP_DB_DSN=mysql:host=…;port=…;dbname=…) instead of the discrete
+        // host/port/name keys — the dev database and socket-based cPanel
+        // setups do exactly that. Pull the endpoint out of the DSN so the
+        // probe (and everything it guards, `cron status` included) still
+        // recognises the server as configured.
+        $dsn = (string)(function_exists('env_str') ? env_str('DB_DSN', '') : '');
+        if ($dsn !== '' && stripos($dsn, 'mysql:') === 0 && ($host === '' || $name === '' || $port === 0)) {
+            foreach (preg_split('/[;]/', $dsn) as $bit) {
+                $kv = explode('=', $bit, 2);
+                if (count($kv) !== 2) continue;
+                $key = strtolower(trim($kv[0]));
+                $value = trim($kv[1]);
+                if ($key === 'host' && $host === '') $host = $value;
+                elseif ($key === 'port' && $port === 0) $port = (int)$value;
+                elseif ($key === 'dbname' && $name === '') $name = $value;
+            }
+        }
+        if (!$port) $port = 3306;
+        if ($host === '' || $name === '') {
+            return false;
+        }
+        $probe = @fsockopen($host === 'localhost' ? '127.0.0.1' : $host, $port, $errno, $errstr, 1);
+        if (!$probe) {
+            return false;
+        }
+        fclose($probe);
+
+        // PDO: the TCP probe is enough at this layer. Let the configured PDO
+        // driver perform authentication so a missing mysqli extension (or a
+        // mysqli function that was not compiled into the runtime) cannot make
+        // an otherwise-healthy PDO connection appear unavailable.
+        if (stripos($driver, 'pdo') === 0) {
+            return true;
+        }
+
+        if (!function_exists('mysqli_init')) {
+            return false;
+        }
+
+        $mysqli = mysqli_init();
+        if (!$mysqli) {
+            return false;
+        }
+        @$mysqli->options(MYSQLI_OPT_CONNECT_TIMEOUT, 2);
+        $handler = set_error_handler(function () { return true; });
+        try {
+            $ok = @$mysqli->real_connect($host, $user, $pass, $name, $port);
+        } catch (Throwable $e) {
+            $ok = false;
+        }
+        if ($handler) { set_error_handler($handler); } else { restore_error_handler(); }
+        if ($ok) {
+            $mysqli->close();
+            return true;
+        }
+        return false;
+    }
+}
+
+if (!function_exists('env_str')) {
+    /** Trimmed string from the environment, or $default when unset/blank. */
+    function env_str($key, $default = null) {
+        $raw = getenv($key);
+        if ($raw === false) return $default;
+        $raw = trim($raw);
+        return $raw === '' ? $default : $raw;
+    }
+}
+
+if (!function_exists('marvy_migration_config')) {
+    /**
+     * The contents of application/config/migration.php as an array.
+     *
+     * `migration.php` is not in the autoloaded config set, and CI3 loads it
+     * *into the Migration library*, not into the global config registry — so
+     * `$this->config->item('migration_version')` reads NULL from a controller
+     * unless the file has been explicitly loaded into its own index first.
+     * Anything that needs the expected schema version (the migrate CLI, the
+     * readiness probe, deploy preflight) has to go through here or it silently
+     * compares against 0.
+     *
+     * @return array
+     */
+    function marvy_migration_config() {
+        static $cache = null;
+        if ($cache !== null) return $cache;
+
+        $cache = array();
+        if (function_exists('get_instance')) {
+            $ci =& get_instance();
+            if ($ci && isset($ci->config) && is_object($ci->config)) {
+                try {
+                    $ci->config->load('migration', TRUE, TRUE);
+                    $loaded = $ci->config->item('migration');
+                    if (is_array($loaded)) $cache = $loaded;
+                } catch (Throwable $e) { /* fall through to the file read */ }
+            }
+        }
+
+        if (!$cache && defined('APPPATH') && is_file(APPPATH.'config/migration.php')) {
+            $config = array();
+            include APPPATH.'config/migration.php';
+            if (is_array($config)) $cache = $config;
+        }
+        return $cache;
+    }
+}
+
+if (!function_exists('marvy_migration_item')) {
+    /** One key from the migration config, with a fallback. */
+    function marvy_migration_item($key, $default = null) {
+        $cfg = marvy_migration_config();
+        return array_key_exists($key, $cfg) ? $cfg[$key] : $default;
+    }
+}
+
+if (!function_exists('marvy_allocate_user_code')) {
+    /**
+     * Allocate an unused six-digit account number.
+     *
+     * The customer-facing account handle: short enough to read over the phone,
+     * quotable to support, and usable as a sign-in identifier alongside the
+     * username and email. The ULID `public_id` remains the canonical internal
+     * identifier — this never replaces it.
+     *
+     * Random rather than sequential. A sequential code would leak the customer
+     * count and growth rate, and would let anyone enumerate accounts by
+     * counting upwards. Starting at 100000 keeps every code six digits, so a
+     * leading zero cannot be lost when it is written down or pasted into a
+     * spreadsheet.
+     *
+     * Lives in the helper because three separate paths create users — customer
+     * registration, the setup wizard and the demo seeder — and a code that only
+     * some of them allocate is worse than none.
+     *
+     * @param object|null $db CI database instance; defaults to the loaded one
+     * @return string|null the code, or NULL if none could be allocated
+     */
+    function marvy_allocate_user_code($db = null) {
+        if ($db === null) {
+            if (!function_exists('get_instance')) return null;
+            $ci =& get_instance();
+            if (!isset($ci->db) || !is_object($ci->db)) return null;
+            $db = $ci->db;
+        }
+
+        for ($attempt = 0; $attempt < 50; $attempt++) {
+            $code = (string) random_int(100000, 999999);
+            try {
+                if ((int) $db->where('user_code', $code)->count_all_results('users') === 0) {
+                    return $code;
+                }
+            } catch (Exception $e) {
+                // Column not present yet (pre-migration install): the caller
+                // simply gets no code rather than a fatal.
+                return null;
+            }
+        }
+
+        log_message('error', 'could not allocate a free user_code after 50 attempts');
+        return null;
+    }
+}

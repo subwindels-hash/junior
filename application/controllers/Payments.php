@@ -1,0 +1,300 @@
+<?php
+defined('BASEPATH') OR exit('No direct script access allowed');
+
+/**
+ * Payments — JSON payment API for the signed-in customer.
+ *
+ *   POST /api/payments/fundsvera/initialize
+ *   GET  /api/payments/history
+ *   GET  /api/payments/:reference
+ *
+ * Thin by design: it authenticates, validates shape, and delegates to
+ * PaymentService. No gateway call, no balance arithmetic and no status
+ * transition happens here — that logic belongs to the service layer so the
+ * dashboard and this API cannot drift apart.
+ *
+ * These are session-authenticated endpoints for the panel's own frontend, not
+ * the reseller API (that is Api_v1, which authenticates by key). A customer can
+ * only ever see their own payments: every lookup is scoped by user_id, so a
+ * guessed reference belonging to someone else returns 404, not their data.
+ */
+class Payments extends MY_Controller {
+
+    public function __construct() {
+        parent::__construct();
+        $this->load->library(array('AuthService', 'PaymentService'));
+        $this->load->model(array('Payment_transaction_model', 'Setting_model'));
+    }
+
+    /**
+     * POST /api/payments/fundsvera/initialize
+     *
+     * Creates the internal payment record first, then asks Fundsvera for
+     * transfer instructions. The order matters: if the provider call fails we
+     * still hold a FAILED record explaining why, rather than a silent gap.
+     */
+    public function initialize() {
+        if ($this->input->method(true) !== 'POST') return $this->json_fail(405, 'METHOD', 'POST required.');
+
+        $user = $this->require_customer();
+        if (!$user) return;
+
+        // Rate limit: initiating a checkout is an outbound API call and a row.
+        $this->load->library('RateLimiter');
+        $bucket = RateLimiter::scope('payinit', (string)$user->id);
+        if ($this->ratelimiter->too_many_failures($this->input->ip_address(), $bucket, 10, 300)) {
+            return $this->json_fail(429, 'RATE_LIMITED', 'Too many payment attempts. Try again shortly.');
+        }
+
+        $payload = $this->json_input();
+        $amount  = isset($payload['amount']) ? $payload['amount'] : $this->input->post('amount');
+
+        $res = $this->paymentservice->deposit($user, array(
+            'payment_method'  => 'fundsvera',
+            'amount'          => $amount,
+            // Charged in the panel's default display currency — the one the
+            // API's own price fields are quoted in.
+            'currency'        => marvy_pay_currency(),
+            'idempotency_key' => $payload['idempotency_key'] ?? $this->input->post('idempotency_key'),
+        ));
+
+        if (empty($res['ok'])) {
+            $this->ratelimiter->record($this->input->ip_address(), $bucket, false, $res['code'] ?? 'DEPOSIT_FAILED');
+            return $this->json_fail(422, $res['code'] ?? 'DEPOSIT_FAILED', $res['error']);
+        }
+
+        $tx = $res['transaction'];
+        $settlement = $this->settlement_fields($tx);
+        return $this->json_ok(array(
+            'reference'    => $tx->internal_reference ?: $tx->public_id,
+            'status'       => $tx->status,
+            'amount'       => (string)$tx->amount,
+            'currency'     => $tx->currency,
+            // The settlement leg and the rate it was pinned at, so a client
+            // can show the customer what this payment is actually worth. The
+            // helper also supplies legacy values when migration 042 is absent.
+            'base_currency' => $settlement['base_currency'],
+            'base_amount'   => $settlement['base_amount'],
+            'fx_rate'       => $settlement['fx_rate'],
+            'checkout'     => $res['checkout'] ?? null,
+            'redirect_url' => $res['redirect_url'] ?? null,
+            // Stated plainly because it is the whole security model: the
+            // redirect is a convenience, the webhook is the truth.
+            'note'         => 'Your wallet is credited when the transfer is confirmed by the payment provider, '
+                             .'not when you return to this site.',
+        ));
+    }
+
+    /**
+     * POST /api/payments/fundsvera/virtual-account
+     *
+     * The customer's standing bank account for wallet top-ups: created on
+     * first call, returned unchanged afterwards. Any amount pushed to it is
+     * credited by the provider's webhook — never by this endpoint.
+     *
+     * Body: {amount?} — with an amount, a declared virtual-account deposit is
+     * opened too (a quoted amount the bank's credit is checked against) and
+     * its reference is returned alongside the account.
+     */
+    public function virtual_account() {
+        if ($this->input->method(true) !== 'POST') return $this->json_fail(405, 'METHOD', 'POST required.');
+
+        $user = $this->require_customer();
+        if (!$user) return;
+
+        // One account per customer per burst: creation is an outbound API call.
+        $this->load->library('RateLimiter');
+        $bucket = RateLimiter::scope('payinit', (string)$user->id);
+        if ($this->ratelimiter->too_many_failures($this->input->ip_address(), $bucket, 10, 300)) {
+            return $this->json_fail(429, 'RATE_LIMITED', 'Too many requests. Try again shortly.');
+        }
+
+        $payload = $this->json_input();
+        $amount  = $payload['amount'] ?? $this->input->post('amount');
+
+        try {
+            $res = ($amount !== null && $amount !== '' && is_numeric($amount))
+                ? $this->paymentservice->open_virtual_account_deposit($user, $amount)
+                : $this->paymentservice->virtual_account($user);
+        } catch (Throwable $e) {
+            log_message('error', 'virtual-account endpoint threw: '.$e->getMessage());
+            return $this->json_fail(500, 'VA_FAILED', 'The bank account service is unavailable right now.');
+        }
+
+        if (empty($res['ok'])) {
+            $this->ratelimiter->record($this->input->ip_address(), $bucket, false, $res['code'] ?? 'VA_FAILED');
+            return $this->json_fail(422, $res['code'] ?? 'VA_FAILED', $res['error']);
+        }
+
+        $account = $res['account'];
+        $data = array(
+            'account_number' => (string)$account->account_number,
+            'account_name'   => (string)$account->account_name,
+            'bank_name'      => (string)$account->bank_name,
+            'status'         => (string)($account->account_status ?? 'Active'),
+            'note'           => 'Pay into this account any time. Your wallet is credited when the bank '
+                               .'confirms the payment — not when you return to this site.',
+        );
+        if (!empty($res['transaction'])) {
+            $tx = $res['transaction'];
+            $data['deposit'] = array(
+                'reference' => $tx->internal_reference ?: $tx->public_id,
+                'amount'    => (string)$tx->amount,
+                'currency'  => $tx->currency,
+                'status'    => $tx->status,
+            );
+        }
+        return $this->json_ok($data);
+    }
+
+    /** GET /api/payments/:reference — status of one payment. */
+    public function show($reference = null) {
+        $user = $this->require_customer();
+        if (!$user) return;
+
+        if (!$reference) return $this->json_fail(400, 'NO_REFERENCE', 'A payment reference is required.');
+
+        $tx = $this->Payment_transaction_model->for_user_reference($user->id, $reference);
+        if (!$tx) return $this->json_fail(404, 'NOT_FOUND', 'No payment with that reference.');
+
+        return $this->json_ok($this->present($tx));
+    }
+
+    /** GET /api/payments/history — this customer's payments. */
+    public function history() {
+        $user = $this->require_customer();
+        if (!$user) return;
+
+        $limit  = max(1, min(100, (int)($this->input->get('limit') ?: 25)));
+        $offset = max(0, (int)$this->input->get('offset'));
+
+        $rows = $this->Payment_transaction_model->admin_search(
+            array('user_id' => $user->id), $limit, $offset
+        );
+
+        $out = array();
+        foreach ($rows as $row) $out[] = $this->present($row);
+        return $this->json_ok(array('payments' => $out, 'limit' => $limit, 'offset' => $offset));
+    }
+
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * The public shape of a payment.
+     *
+     * Deliberately excludes provider credentials, raw payloads and internal
+     * ids. A customer needs to know what they paid and whether it landed.
+     */
+    private function present($tx) {
+        $settlement = $this->settlement_fields($tx);
+        return array(
+            'reference'        => $tx->internal_reference ?: $tx->public_id,
+            'provider'         => $tx->provider,
+            'payment_method'   => $tx->payment_method,
+            // What the customer is charged, in the currency the gateway took.
+            'amount'           => (string)$tx->amount,
+            'fee'              => (string)$tx->fee,
+            'currency'         => $tx->currency,
+            // What the wallet is credited with, in the accounting currency,
+            // at the rate pinned when the deposit was opened. On a panel where
+            // the two currencies coincide these simply mirror the pair above.
+            'credited_amount'  => isset($tx->credited_amount) && $tx->credited_amount !== null
+                ? (string)$tx->credited_amount : null,
+            'base_currency'    => $settlement['base_currency'],
+            'base_amount'      => $settlement['base_amount'],
+            'credited_base_amount' => $settlement['credited_base_amount'],
+            'fx_rate'          => $settlement['fx_rate'],
+            'status'           => $tx->status,
+            'provider_reference' => $tx->provider_tx_id,
+            'initiated_at'     => $tx->initiated_at,
+            'paid_at'          => $tx->paid_at,
+            'failed_at'        => $tx->failed_at,
+            'created_at'       => $tx->created_at,
+        );
+    }
+
+    /**
+     * Return the settlement leg without assuming migration-042 columns exist.
+     * Compatibility rows may carry the pinned base leg in metadata; genuinely
+     * old rows never had those properties, so their charge columns are their
+     * exact settlement values and the pinned rate is one.
+     */
+    private function settlement_fields($tx) {
+        $metadata_settlement = $this->settlement_from_metadata($tx);
+        if ($metadata_settlement !== null) return $metadata_settlement;
+
+        $base_currency = isset($tx->base_currency) && $tx->base_currency
+            ? (string)$tx->base_currency : (string)$tx->currency;
+        $base_amount = isset($tx->base_amount) && $tx->base_amount !== null
+            ? (string)$tx->base_amount : (string)$tx->amount;
+        $credited = isset($tx->credited_base_amount) && $tx->credited_base_amount !== null
+            ? (string)$tx->credited_base_amount
+            : (isset($tx->credited_amount) && $tx->credited_amount !== null
+                ? (string)$tx->credited_amount : (string)$tx->amount);
+        $fx_rate = isset($tx->fx_rate) && $tx->fx_rate !== null
+            ? (string)$tx->fx_rate : '1.00000000';
+
+        return array(
+            'base_currency'        => $base_currency,
+            'base_amount'          => $base_amount,
+            'credited_base_amount' => $credited,
+            'fx_rate'              => $fx_rate,
+        );
+    }
+
+    /** Metadata-backed settlement fields for pre-migration-042 compatibility rows. */
+    private function settlement_from_metadata($tx) {
+        $meta = json_decode((string)($tx->metadata ?? ''), true);
+        if (!is_array($meta) || !isset($meta['settlement']) || !is_array($meta['settlement'])) return null;
+        $s = $meta['settlement'];
+        $currency = strtoupper(trim((string)($s['base_currency'] ?? '')));
+        $base = (string)($s['base_amount'] ?? '');
+        $credited = (string)($s['credited_base_amount'] ?? ($s['base_amount'] ?? ''));
+        $rate = (string)($s['fx_rate'] ?? '');
+        if (!preg_match('/^[A-Z]{3}$/', $currency)) return null;
+        if (!is_numeric($base) || !is_numeric($credited) || !is_numeric($rate)) return null;
+        if (function_exists('bccomp') && bccomp($rate, '0', 8) <= 0) return null;
+        if (!function_exists('bccomp') && (float)$rate <= 0) return null;
+        return array(
+            'base_currency'        => $currency,
+            'base_amount'          => $base,
+            'credited_base_amount' => $credited,
+            'fx_rate'              => $rate,
+        );
+    }
+
+    /** The signed-in customer, or a 401 JSON body. */
+    private function require_customer() {
+        $user = $this->authservice->check() ? $this->authservice->user() : null;
+        if (!$user) {
+            $this->json_fail(401, 'UNAUTHENTICATED', 'Sign in to use this endpoint.');
+            return null;
+        }
+        return $user;
+    }
+
+    /** Accept a JSON body as well as form-encoded input. */
+    private function json_input() {
+        $raw = file_get_contents('php://input');
+        if (!$raw) return array();
+        $decoded = json_decode($raw, true);
+        return is_array($decoded) ? $decoded : array();
+    }
+
+    private function json_ok(array $data) {
+        return $this->output
+            ->set_content_type('application/json')
+            ->set_status_header(200)
+            ->set_output(json_encode(array('success' => true, 'data' => $data), JSON_UNESCAPED_SLASHES));
+    }
+
+    private function json_fail($http, $code, $message) {
+        return $this->output
+            ->set_content_type('application/json')
+            ->set_status_header($http)
+            ->set_output(json_encode(array(
+                'success' => false,
+                'error'   => array('code' => $code, 'message' => $message),
+            ), JSON_UNESCAPED_SLASHES));
+    }
+}

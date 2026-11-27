@@ -1,0 +1,233 @@
+<?php
+defined('BASEPATH') OR exit('No direct script access allowed');
+
+class Payment_transaction_model extends MY_Model {
+    protected $table = 'payment_transactions';
+
+    public function for_user($user_id, $limit=25, $offset=0){
+        // created_at has second granularity, so two deposits started within
+        // the same second would order arbitrarily without the id tie-break —
+        // and a customer skimming "Recent deposits" would open the older one.
+        return $this->decorate_many($this->db->where('user_id',$user_id)
+            ->order_by('created_at','DESC')->order_by('id','DESC')
+            ->limit($limit,$offset)->get($this->table)->result());
+    }
+    public function find_by_provider_tx($provider_tx_id){
+        return $this->decorate($this->db->where('provider_tx_id',$provider_tx_id)->get($this->table)->row());
+    }
+    public function find_by_idempotency_key($key){
+        if (!$key) return null;
+        return $this->decorate($this->db->where('idempotency_key',$key)->get($this->table)->row());
+    }
+    public function find_by_id($id){ return $this->decorate($this->db->where('id',$id)->get($this->table)->row()); }
+    /**
+     * One payment belonging to this customer, by either reference form.
+     *
+     * Always scoped by user_id: a guessed reference that belongs to someone
+     * else must return nothing rather than another customer's payment. Accepts
+     * the internal_reference (what the provider and support quote) or the
+     * public_id (what older links carry).
+     */
+    public function for_user_reference($user_id, $reference){
+        return $this->decorate($this->db->where('user_id', (int)$user_id)
+                        ->group_start()
+                            ->where('internal_reference', $reference)
+                            ->or_where('public_id', $reference)
+                        ->group_end()
+                        ->get($this->table)->row());
+    }
+
+    public function find_public_for_user($public_id, $user_id){
+        return $this->decorate($this->db->where('public_id',$public_id)->where('user_id',$user_id)->get($this->table)->row());
+    }
+    public function update_status($id, array $data){ return $this->db->where('id',$id)->update($this->table,$data); }
+    public function count_for_user($user_id, $status=null){
+        $this->db->where('user_id',$user_id);
+        if ($status) $this->db->where('status',$status);
+        return (int)$this->db->count_all_results($this->table);
+    }
+
+    /* ------------------------- admin queries ------------------------- */
+
+    /**
+     * Deposit queue for the back office. Unscoped by design — only reachable
+     * behind `payments.view`.
+     *
+     * @param array $filters status|method_id|search
+     */
+    public function admin_search(array $filters, $limit = 25, $offset = 0){
+        $this->admin_filters($filters);
+        // users is already joined by admin_filters(); joining it twice is a
+        // SQL error.
+        return $this->decorate_many($this->db
+            ->select('payment_transactions.*, users.username, users.email,
+                      payment_methods.name AS method_name, payment_methods.type AS method_type', false)
+            ->join('payment_methods', 'payment_methods.id = payment_transactions.payment_method_id', 'left')
+            ->order_by('payment_transactions.created_at', 'DESC')
+            ->limit($limit, $offset)
+            ->get()->result());
+    }
+
+    public function admin_count(array $filters){
+        $this->admin_filters($filters);
+        return (int)$this->db->count_all_results();
+    }
+
+    /**
+     * Shared WHERE clauses for the admin grid and its count.
+     *
+     * The join is applied here, not only in admin_search(): the search filter
+     * matches on users.email/username, so a count that omitted the join threw
+     * "no such column: users.email" and turned any search into a 500. Both
+     * queries must see the same tables or they cannot agree on the same rows.
+     */
+    private function admin_filters(array $f){
+        $this->db->from($this->table)
+                 ->join('users', 'users.id = payment_transactions.user_id', 'left');
+        if (!empty($f['status']))    $this->db->where('payment_transactions.status', $f['status']);
+        if (!empty($f['method_id'])) $this->db->where('payment_transactions.payment_method_id', (int)$f['method_id']);
+        if (!empty($f['search'])) {
+            $term = trim((string)$f['search']);
+            $this->db->group_start()
+                ->like('payment_transactions.public_id', $term)
+                // internal_reference is what the customer sees, what we send
+                // the provider as request_id, and therefore what support is
+                // given when someone asks about a payment. Omitting it made
+                // the search useless for the most common question.
+                ->or_like('payment_transactions.internal_reference', $term)
+                ->or_like('payment_transactions.provider_tx_id', $term)
+                ->or_like('users.email', $term)
+                ->or_like('users.username', $term)
+                ->group_end();
+        }
+    }
+
+    /** One transaction with its user and method, by public id. */
+    public function admin_find($public_id){
+        return $this->decorate($this->db
+            ->select('payment_transactions.*, users.username, users.email,
+                      payment_methods.name AS method_name, payment_methods.type AS method_type', false)
+            ->from($this->table)
+            ->join('users', 'users.id = payment_transactions.user_id', 'left')
+            ->join('payment_methods', 'payment_methods.id = payment_transactions.payment_method_id', 'left')
+            ->where('payment_transactions.public_id', $public_id)
+            ->get()->row());
+    }
+
+    /** @var bool|null Cached for this request; a schema cannot change mid-page. */
+    private $deposit_currency_schema_ready = null;
+
+    /**
+     * Whether migration 042's charge/settlement split is available.
+     *
+     * Existing cPanel installations can receive application files before the
+     * operator imports the accompanying SQL upgrade. The payments queue must
+     * remain available while that mismatch is being repaired: it is the page
+     * staff use to see and action pending deposits. Checking the columns here
+     * also lets the controller show an actionable warning instead of a blank
+     * HTTP 500 page.
+     */
+    public function deposit_currency_schema_ready(){
+        if ($this->deposit_currency_schema_ready !== null) {
+            return $this->deposit_currency_schema_ready;
+        }
+
+        $have = array();
+        try {
+            foreach ((array)$this->db->field_data($this->table) as $field) {
+                $name = is_object($field) ? ($field->name ?? '') : ($field['name'] ?? '');
+                if ($name !== '') $have[strtolower((string)$name)] = true;
+            }
+        } catch (Exception $e) {
+            return $this->deposit_currency_schema_ready = false;
+        } catch (Throwable $e) {
+            return $this->deposit_currency_schema_ready = false;
+        }
+
+        foreach (array('base_currency', 'base_amount', 'credited_base_amount', 'fx_rate') as $column) {
+            if (!isset($have[$column])) {
+                return $this->deposit_currency_schema_ready = false;
+            }
+        }
+        return $this->deposit_currency_schema_ready = true;
+    }
+
+    /**
+     * Totals for the queue header cards.
+     *
+     * Summed over the BASE-currency legs, never the charge amounts. Deposits
+     * can now be charged in a different currency than the books are kept in
+     * (migration 042), and adding a ₦1,328 charge to a $1 one produces a
+     * number that means nothing. `base_amount` / `credited_base_amount` are
+     * one currency by definition; COALESCE covers rows created before 042.
+     *
+     * If application files reached an existing server before migration 042,
+     * use the legacy columns temporarily. Referring to a missing base_amount
+     * in SQL is what made /admin/payments return HTTP 500; the page now opens,
+     * labels the totals as legacy, and points the operator to the safe upgrade.
+     */
+    public function admin_totals(){
+        $schema_ready = $this->deposit_currency_schema_ready();
+        $pending_amount = $schema_ready ? 'COALESCE(base_amount, amount)' : 'amount';
+        $credited_amount = $schema_ready
+            ? 'COALESCE(credited_base_amount, credited_amount, amount)'
+            : 'COALESCE(credited_amount, amount)';
+
+        $row = $this->db
+            ->select("COUNT(*) AS total", false)
+            ->select("COALESCE(SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END),0) AS pending_count", false)
+            ->select("COALESCE(SUM(CASE WHEN status='PENDING' THEN {$pending_amount} ELSE 0 END),0) AS pending_amount", false)
+            ->select("COALESCE(SUM(CASE WHEN status='SUCCESS' THEN {$credited_amount} ELSE 0 END),0) AS credited", false)
+            ->get($this->table)->row();
+        return array(
+            'total'          => (int)($row->total ?? 0),
+            'pending_count'  => (int)($row->pending_count ?? 0),
+            'pending_amount' => (string)($row->pending_amount ?? '0.00000000'),
+            'credited'       => (string)($row->credited ?? '0.00000000'),
+        );
+    }
+
+    /** Decorate a list of rows with metadata-backed settlement fields. */
+    private function decorate_many($rows){
+        foreach ($rows as $row) $this->decorate($row);
+        return $rows;
+    }
+
+    /**
+     * Fill migration-042 settlement properties from metadata when the live
+     * database has not been upgraded yet.
+     *
+     * New code can then read `$tx->base_currency`, `$tx->base_amount`,
+     * `$tx->credited_base_amount` and `$tx->fx_rate` consistently whether the
+     * values came from real columns or the compatibility JSON block. Historical
+     * rows that predate the compatibility block are left untouched; those were
+     * genuinely charged in their stored currency.
+     */
+    private function decorate($row){
+        if (!$row || !is_object($row)) return $row;
+
+        $meta = json_decode((string)($row->metadata ?? ''), true);
+        if (!is_array($meta) || !isset($meta['settlement']) || !is_array($meta['settlement'])) {
+            return $row;
+        }
+        $s = $meta['settlement'];
+        $currency = strtoupper(trim((string)($s['base_currency'] ?? '')));
+        $base_amount = (string)($s['base_amount'] ?? '');
+        $credited = (string)($s['credited_base_amount'] ?? ($s['base_amount'] ?? ''));
+        $rate = (string)($s['fx_rate'] ?? '');
+        if (!preg_match('/^[A-Z]{3}$/', $currency)) return $row;
+        if (!is_numeric($base_amount) || !is_numeric($credited) || !is_numeric($rate)) return $row;
+        if (function_exists('bccomp') && bccomp($rate, '0', 8) <= 0) return $row;
+        if (!function_exists('bccomp') && (float)$rate <= 0) return $row;
+
+        // Metadata settlement exists only for compatibility rows created while
+        // the database lacked the columns, so it is the authoritative source.
+        // Prefer it even after the SQL upgrade has later filled the columns,
+        // in case an older upgrade script backfilled those rows as 1:1.
+        $row->base_currency = $currency;
+        $row->base_amount = $base_amount;
+        $row->credited_base_amount = $credited;
+        $row->fx_rate = $rate;
+        return $row;
+    }
+}
