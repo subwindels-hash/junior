@@ -1,0 +1,346 @@
+<?php
+defined('BASEPATH') OR exit('No direct script access allowed');
+
+/**
+ * CurrencyService — display-currency configuration and conversion.
+ *
+ * ## What this is
+ *
+ * The panel's accounting/settlement currency (`marvy_base_currency()`, NGN by
+ * default) remains the denomination for wallets, orders, earnings, payouts
+ * and purchase/refund accounting. Catalogue conversion is informational and a
+ * wallet purchase still settles in that base currency.
+ *
+ * Wallet DEPOSITS have one deliberate exception: Manual / Bank Transfer and
+ * Fundsvera collect the default display currency selected here. Their payment
+ * transaction keeps that customer charge unchanged and pins the exchange rate
+ * and base-currency settlement leg used to credit the wallet. Changing the
+ * accounting currency later converts only that settlement leg; it never
+ * rewrites what the customer or bank actually paid.
+ *
+ * ## Why this is not multi-currency order settlement
+ *
+ * Letting every order, refund and commission settle independently in a display
+ * currency would require every domain service (OrderService,
+ * TransactionEngine, MarketplaceService, GiftcardService, PayoutService) to
+ * agree on a rate snapshot. This service keeps those core purchase paths in
+ * the base currency while providing real admin control over browsing and the
+ * explicit, rate-pinned deposit boundary described above.
+ *
+ * ## Where the rate comes from
+ *
+ * `currencies.exchange_rate` is "units of this currency per 1 unit of the
+ * base currency" — the same convention migration 011 established. Rates can
+ * be set manually (`rate_source = 'MANUAL'`) or by the hourly `currency_rates`
+ * background job (`rate_source = 'AUTO:<provider-host>'`). The automatic job
+ * updates NGN too by pinning the base row to 1.00000000 and refreshing its
+ * provenance fields; either path records who/what changed the row and when.
+ */
+class CurrencyService {
+
+    /** Currencies this build ships symbols/support for out of the box. */
+    const KNOWN = array('NGN', 'USD', 'EUR', 'GBP', 'INR', 'BRL');
+
+    private $ci;
+
+    /** Memo for display_code(); see the method for why. */
+    private $display_code = null;
+
+    public function __construct() {
+        $this->ci =& get_instance();
+        $this->ci->load->model(array('Currency_model', 'Setting_model'));
+    }
+
+    /** Every configured currency (admin view). */
+    public function all() {
+        return $this->ci->Currency_model->all_rows();
+    }
+
+    /** Currencies a customer may currently choose to browse in. */
+    public function active() {
+        return $this->ci->Currency_model->active();
+    }
+
+    /** The immutable accounting/settlement currency. Never changes here. */
+    public function base_code() {
+        return marvy_base_currency();
+    }
+
+    /**
+     * The currency browsing customers see prices converted into.
+     *
+     * Falls back to the base currency when unset, disabled, or the setting
+     * points at a currency that no longer exists — a stale/invalid setting
+     * must never make prices disappear or throw.
+     */
+    public function display_code() {
+        // Resolved once per request. Every formatted price asks for it, and it
+        // costs a settings read plus a currency read each time — on a
+        // catalogue page that was one pair of queries per row on screen.
+        if ($this->display_code !== null) return $this->display_code;
+        $code = strtoupper((string)$this->ci->Setting_model->get('default_display_currency', $this->base_code()));
+        $row = $this->ci->Currency_model->find($code);
+        return $this->display_code = ($row && (int)$row->is_active === 1) ? $code : $this->base_code();
+    }
+
+    /** Forget the memo after a change of currency configuration. */
+    public function forget() {
+        $this->display_code = null;
+        if (class_exists('Currency_model')) Currency_model::forget();
+        // The helper memoises the same answer for the rest of the request;
+        // leaving it set is how a just-saved currency change fails to show up
+        // on the page that saved it.
+        if (function_exists('marvy_forget_display_currency')) marvy_forget_display_currency();
+    }
+
+    /**
+     * Convert an amount denominated in the base currency into `$to` (defaults
+     * to the configured display currency). Returns the amount unchanged if
+     * `$to` is the base currency or is not a known, active currency.
+     */
+    public function convert($amount, $to = null) {
+        $to = strtoupper((string)($to ?: $this->display_code()));
+        if ($to === $this->base_code()) return (string)$amount;
+        $row = $this->ci->Currency_model->find($to);
+        if (!$row || (int)$row->is_active !== 1) return (string)$amount;
+        return bcmul((string)$amount, (string)$row->exchange_rate, 8);
+    }
+
+    /** Whether `$from` has a usable path into the accounting currency. */
+    public function can_convert_to_base($from = null) {
+        return $this->to_base('1', $from) !== null;
+    }
+
+    /**
+     * Convert an amount denominated in `$from` into the base/accounting
+     * currency. Exchange rates are stored as "units of currency per 1 base",
+     * so foreign → base is the inverse operation: amount ÷ exchange_rate.
+     *
+     * This is intentionally stricter than display conversion. If a listing or
+     * provider says "USD 1.00" and there is no usable USD/NGN rate, returning
+     * the amount unchanged would charge ₦1 instead of roughly ₦1,550. Callers
+     * that move money should treat NULL as "do not sell until the rate is set".
+     */
+    public function to_base($amount, $from = null) {
+        $from = strtoupper((string)($from ?: $this->base_code()));
+        if ($from === $this->base_code()) return (string)$amount;
+        if (!is_numeric($amount)) return null;
+
+        $row = $this->ci->Currency_model->find($from);
+        if (!$row || (int)$row->is_active !== 1 || !is_numeric($row->exchange_rate)
+                || bccomp((string)$row->exchange_rate, '0', 8) <= 0) {
+            return null;
+        }
+        return bcdiv((string)$amount, (string)$row->exchange_rate, 8);
+    }
+
+    /**
+     * Format an amount as the given (or configured display) currency, honouring
+     * the currency's own decimal precision and the panel's symbol/code display
+     * setting — the same formatting rules marvy_money() applies for the base
+     * currency, extended to any configured currency.
+     */
+    public function format($amount, $code = null) {
+        $code = strtoupper((string)($code ?: $this->display_code()));
+        $row = $this->ci->Currency_model->find($code);
+        $decimals = $row ? (int)$row->decimal_precision : 2;
+        $formatted = number_format((float)$amount, $decimals, '.', ',');
+
+        $display = strtolower((string)$this->ci->Setting_model->get('currency_display', 'symbol'));
+        if ($display === 'code') return $code.' '.$formatted;
+
+        $symbol = $row ? $row->symbol : ($code.' ');
+        return $symbol.$formatted;
+    }
+
+    /** Convert-then-format in one call: the base-currency amount shown in the display currency. */
+    public function display($amount, $to = null) {
+        $to = $to ?: $this->display_code();
+        return $this->format($this->convert($amount, $to), $to);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Admin mutations                                                     */
+    /* ------------------------------------------------------------------ */
+
+    /** Enable or disable a currency for display. The base currency can never be disabled. */
+    public function set_active($code, $active, $actor_id) {
+        $code = strtoupper(trim((string)$code));
+        $row = $this->ci->Currency_model->find($code);
+        if (!$row) return $this->err('NOT_FOUND', 'Unknown currency.');
+        if ((int)$row->is_base === 1 && !$active) {
+            return $this->err('BASE_CURRENCY', 'The base currency cannot be disabled.');
+        }
+        $before = (int)$row->is_active;
+        if (!$this->ci->Currency_model->set_active($code, $active)) {
+            return $this->err('UPDATE_FAILED', 'Could not update that currency.');
+        }
+        $this->audit($actor_id, 'currency.active_changed', $code,
+            array('is_active' => $before), array('is_active' => $active ? 1 : 0));
+
+        // If the currency being disabled was the configured display default,
+        // fall back to the base currency rather than leaving a dangling
+        // setting that quietly stops converting anything.
+        if (!$active && strtoupper((string)$this->ci->Setting_model->get('default_display_currency', '')) === $code) {
+            $this->ci->Setting_model->set('default_display_currency', $this->base_code(), 'currency');
+        }
+        $this->forget();
+        return array('ok' => true);
+    }
+
+    /**
+     * Set the default display currency. Must be active (or the base currency,
+     * which is always active); refuses silently-wrong configuration rather
+     * than accepting a code nothing can convert into.
+     */
+    public function set_display_default($code, $actor_id) {
+        $code = strtoupper(trim((string)$code));
+        $row = $this->ci->Currency_model->find($code);
+        if (!$row) return $this->err('NOT_FOUND', 'Unknown currency.');
+        if ((int)$row->is_active !== 1) {
+            return $this->err('INACTIVE', 'Enable that currency before making it the default.');
+        }
+        $before = (string)$this->ci->Setting_model->get('default_display_currency', $this->base_code());
+        $this->ci->Setting_model->set('default_display_currency', $code, 'currency');
+        if ($before !== $code) {
+            $this->audit($actor_id, 'currency.default_display_changed', $code,
+                array('default_display_currency' => $before), array('default_display_currency' => $code));
+        }
+        $this->forget();
+        return array('ok' => true);
+    }
+
+    /**
+     * Mark the base currency row refreshed during automatic FX sync.
+     *
+     * A base currency's rate is not editable and not fetched from the market:
+     * it is 1 unit of itself. The automatic job still calls this so NGN gets
+     * the same refreshed source/timestamp trail as USD/EUR/GBP/etc. while the
+     * accounting invariant remains pinned at 1.00000000.
+     */
+    public function refresh_base_rate($code, $actor_id, $source = 'AUTO') {
+        $code = strtoupper(trim((string)$code));
+        $row = $this->ci->Currency_model->find($code);
+        if (!$row) return $this->err('NOT_FOUND', 'Unknown currency.');
+        if ((int)$row->is_base !== 1) {
+            return $this->err('NOT_BASE', 'Only the base currency can be refreshed this way.');
+        }
+
+        $before = (string)$row->exchange_rate;
+        if (!$this->ci->Currency_model->refresh_base_rate($code, $actor_id, $source)) {
+            return $this->err('UPDATE_FAILED', 'Could not update the base currency refresh metadata.');
+        }
+        $this->audit($actor_id, 'currency.base_rate_refreshed', $code,
+            array('exchange_rate' => $before), array('exchange_rate' => '1.00000000', 'source' => $source));
+        $this->forget();
+        return array('ok' => true);
+    }
+
+    /**
+     * Manually record an exchange rate. Rejects a non-positive or absurd rate
+     * outright — a fat-fingered "0" or a rate with a misplaced decimal is not
+     * a policy decision, it is silent data corruption for every price shown
+     * to a customer in that currency, and this is exactly the failure mode
+     * the platform explicitly must not allow to pass silently.
+     */
+    public function set_rate($code, $rate, $actor_id, $source = 'MANUAL') {
+        $code = strtoupper(trim((string)$code));
+        $row = $this->ci->Currency_model->find($code);
+        if (!$row) return $this->err('NOT_FOUND', 'Unknown currency.');
+        if ((int)$row->is_base === 1) {
+            return $this->err('BASE_CURRENCY', 'The base currency is always exactly 1.0 and cannot be changed.');
+        }
+        if (!is_numeric($rate) || bccomp((string)$rate, '0', 8) <= 0) {
+            return $this->err('BAD_RATE', 'The exchange rate must be a positive number.');
+        }
+        // Sanity bound: catches an obvious data-entry mistake (e.g. typing the
+        // inverse rate) without hard-coding what a "normal" rate looks like
+        // for every possible currency pair.
+        if (bccomp((string)$rate, '1000000', 8) > 0) {
+            return $this->err('BAD_RATE', 'That rate looks like a mistake — double-check the direction '
+                .'(units of '.$code.' per 1 unit of '.$this->base_code().').');
+        }
+
+        $before = (string)$row->exchange_rate;
+        if (!$this->ci->Currency_model->set_rate($code, $rate, $actor_id, $source)) {
+            return $this->err('UPDATE_FAILED', 'Could not update that exchange rate.');
+        }
+        $this->audit($actor_id, 'currency.rate_changed', $code,
+            array('exchange_rate' => $before), array('exchange_rate' => number_format((float)$rate, 8, '.', ''), 'source' => $source));
+        // Drop the per-request memo so anything rendered after this point in
+        // the same request (and the next page load) prices off the new rate
+        // rather than the one read before the write.
+        $this->forget();
+        return array('ok' => true);
+    }
+
+    /**
+     * Manually set the base currency's own market value, expressed in USD per
+     * 1 unit of the base currency (e.g. 0.00075300 ≈ ₦1,328/$).
+     *
+     * The base row itself stays pinned at 1.00000000 — that invariant is what
+     * keeps every stored amount meaning what it says. What an operator
+     * actually means by "the naira's rate", though, is its dollar value, and
+     * that number lives on the USD row (units of USD per ₦1). So this gives
+     * NGN a manual rate box like every other currency, and writes it where it
+     * belongs, with the same validation, provenance and audit trail.
+     */
+    public function set_base_rate($rate, $actor_id, $source = 'MANUAL') {
+        $base = $this->base_code();
+        $quote = $this->base_quote_code();
+        if ($quote === null) {
+            return $this->err('NO_QUOTE_ROW',
+                'No quote currency is configured to hold the '.$base.' market rate.');
+        }
+        $res = $this->set_rate($quote, $rate, $actor_id, $source);
+        if (!empty($res['ok'])) {
+            // Record the change under the base currency too, so an audit for
+            // "who moved the naira rate" finds it where an operator looks.
+            $this->audit($actor_id, 'currency.base_rate_set', $base, null,
+                array('quote' => $quote, 'rate' => number_format((float)$rate, 8, '.', ''), 'source' => $source));
+        }
+        return $res;
+    }
+
+    /**
+     * The currency row that carries the base currency's market value — USD
+     * when it exists (and is not itself the base), otherwise the first other
+     * configured currency. Returns null when nothing can hold the rate.
+     */
+    public function base_quote_code() {
+        $usd = $this->ci->Currency_model->find('USD');
+        if ($usd && (int)$usd->is_base !== 1) return 'USD';
+        foreach ($this->all() as $row) {
+            if ((int)$row->is_base !== 1) return strtoupper($row->code);
+        }
+        return null;
+    }
+
+    /** The current market rate of the base currency (units of quote per 1 base), or null. */
+    public function base_rate() {
+        $quote = $this->base_quote_code();
+        if ($quote === null) return null;
+        $row = $this->ci->Currency_model->find($quote);
+        return $row ? (string)$row->exchange_rate : null;
+    }
+
+    /* ------------------------------------------------------------------ */
+
+    private function err($code, $message) {
+        return array('ok' => false, 'code' => $code, 'error' => $message);
+    }
+
+    private function audit($actor_id, $action, $entity, $before = null, $after = null) {
+        try {
+            $this->ci->load->model('Audit_log_model');
+            $this->ci->Audit_log_model->record(
+                $actor_id ?: null, $action, 'currencies', (string)$entity, $before, $after,
+                isset($this->ci->input) ? $this->ci->input->ip_address() : null,
+                isset($this->ci->input) ? $this->ci->input->user_agent() : null,
+                method_exists($this->ci, 'request_id') ? $this->ci->request_id() : null
+            );
+        } catch (Throwable $e) {
+            log_message('error', 'currency audit failed: '.$e->getMessage());
+        }
+    }
+}

@@ -1,0 +1,697 @@
+<?php
+use PHPUnit\Framework\TestCase;
+
+require_once dirname(__DIR__).'/_support/FakeDb.php';
+require_once dirname(__DIR__).'/_support/IntegrationHarness.php';
+
+/**
+ * Admin customer directory, staff roles and manual wallet adjustments
+ * (Session 30).
+ *
+ * `admin/customers` was routed and in the sidebar since Session 15, and
+ * `users.view` / `users.edit` / `wallets.adjust` were all seeded into the role
+ * matrix — but no controller existed, so the nav entry 404'd and those three
+ * permissions gated nothing at all. Support could not suspend a fraudulent
+ * account or correct a balance without hand-written SQL.
+ *
+ * The tests concentrate on the two ways this screen could be genuinely
+ * dangerous rather than on CRUD mechanics:
+ *
+ *   1. **Privilege escalation.** Editing your own role, minting a SUPER_ADMIN
+ *      without being one, or demoting the last owner and bricking the panel.
+ *   2. **Money.** A manual adjustment is a real ledger movement, so it must be
+ *      double-entry, floored at zero and idempotent, exactly like a purchase.
+ *      A screen that writes `wallets.balance` directly would pass a naive test
+ *      and silently destroy the ledger's integrity.
+ */
+class AdminUsersTest extends TestCase
+{
+    private static $root;
+
+    public static function setUpBeforeClass(): void
+    {
+        self::$root = dirname(dirname(__DIR__));
+        if (!defined('BASEPATH')) define('BASEPATH', self::$root.'/system/');
+        if (!class_exists('CI_Model')) {
+            eval('#[AllowDynamicProperties] class CI_Model { public $db; }');
+        }
+        if (!function_exists('get_instance')) {
+            eval('function &get_instance(){ return $GLOBALS["__fake_ci"]; }');
+        }
+        if (!function_exists('log_message')) eval('function log_message($l,$m){}');
+        require_once self::$root.'/application/core/MY_Model.php';
+        require_once self::$root.'/application/helpers/marvy_helper.php';
+    }
+
+    /** A world with staff, a customer and a funded wallet. */
+    private function app($balance = '5000')
+    {
+        $app = new IntegrationHarness();
+        $app->seed_minimal();
+        $owner    = $app->register('owner',  'owner@x.test',  'Str0ng!pass1', 'SUPER_ADMIN');
+        $admin    = $app->register('admin1', 'admin@x.test',  'Str0ng!pass1', 'ADMIN');
+        $customer = $app->register('cust1',  'cust@x.test');
+        $app->credit($customer, $balance);
+        $app->library(array('LedgerService', 'UserAdminService'));
+        $app->model(array('User_model', 'Wallet_model', 'Wallet_transaction_model'));
+        return array($app, $owner, $admin, $customer);
+    }
+
+    /* ===================== privilege-escalation guards ==================== */
+
+    /**
+     * The guard that matters most: nobody edits their own privileges.
+     *
+     * An admin who can promote themselves does not need anyone's approval to
+     * own the panel, and one who can demote themselves can lock the team out
+     * by accident.
+     */
+    public function testAnAdminCannotChangeTheirOwnRole()
+    {
+        list($app, , $admin,) = $this->app();
+
+        $res = $app->useradminservice->set_role($admin, $admin, 'SUPER_ADMIN');
+
+        $this->assertFalse($res['ok']);
+        $this->assertSame('SELF', $res['code']);
+        $this->assertSame('ADMIN', $app->User_model->find_by_id($admin->id)->role,
+            'a refused promotion must not half-apply');
+    }
+
+    public function testAnAdminCannotSuspendTheirOwnAccount()
+    {
+        list($app, , $admin,) = $this->app();
+
+        $res = $app->useradminservice->set_status($admin, $admin, 'SUSPENDED');
+
+        $this->assertFalse($res['ok']);
+        $this->assertSame('SELF', $res['code']);
+        $this->assertSame('ACTIVE', $app->User_model->find_by_id($admin->id)->status);
+    }
+
+    /**
+     * Without this, `staff.manage` is quietly equivalent to owning the panel:
+     * an ADMIN promotes a colleague to SUPER_ADMIN, or themselves via that
+     * colleague.
+     */
+    public function testOnlyASuperAdminCanGrantSuperAdmin()
+    {
+        list($app, $owner, $admin, $customer) = $this->app();
+
+        $denied = $app->useradminservice->set_role($admin, $customer, 'SUPER_ADMIN');
+        $this->assertFalse($denied['ok']);
+        $this->assertSame('FORBIDDEN', $denied['code']);
+        $this->assertSame('CUSTOMER', $app->User_model->find_by_id($customer->id)->role);
+
+        // The owner may do exactly the same thing.
+        $allowed = $app->useradminservice->set_role($owner, $customer, 'SUPER_ADMIN');
+        $this->assertTrue($allowed['ok'], $allowed['error'] ?? '');
+        $this->assertSame('SUPER_ADMIN', $app->User_model->find_by_id($customer->id)->role);
+    }
+
+    /**
+     * The one that turns a panel into a brick.
+     *
+     * Demoting the last owner leaves nobody who can grant the role back, so
+     * the check counts live rows rather than trusting a flag.
+     */
+    public function testTheLastSuperAdminCannotBeDemoted()
+    {
+        list($app, $owner, , ) = $this->app();
+
+        $res = $app->useradminservice->set_role($owner, $owner, 'ADMIN');
+        $this->assertFalse($res['ok']);
+        $this->assertSame('SUPER_ADMIN', $app->User_model->find_by_id($owner->id)->role);
+    }
+
+    public function testTheLastSuperAdminCannotBeSuspended()
+    {
+        list($app, $owner, $admin, ) = $this->app();
+
+        $res = $app->useradminservice->set_status($admin, $owner, 'SUSPENDED');
+
+        $this->assertFalse($res['ok']);
+        $this->assertSame('LAST_ADMIN', $res['code']);
+        $this->assertSame('ACTIVE', $app->User_model->find_by_id($owner->id)->status);
+    }
+
+    /** ...but once a second owner exists, the first is no longer load-bearing. */
+    public function testASuperAdminCanBeDemotedOnceAnotherExists()
+    {
+        list($app, $owner, , $customer) = $this->app();
+        $app->useradminservice->set_role($owner, $customer, 'SUPER_ADMIN');
+        // Re-read: the actor's privileges are whatever the row says now, not
+        // what the caller happened to load earlier.
+        $second_owner = $app->User_model->find_by_id($customer->id);
+
+        $res = $app->useradminservice->set_role($second_owner, $owner, 'ADMIN');
+
+        $this->assertTrue($res['ok'], $res['error'] ?? '');
+        $this->assertSame('ADMIN', $app->User_model->find_by_id($owner->id)->role);
+    }
+
+    public function testAnUnknownRoleOrStatusIsRejected()
+    {
+        list($app, $owner, , $customer) = $this->app();
+
+        $role = $app->useradminservice->set_role($owner, $customer, 'ROOT');
+        $this->assertFalse($role['ok']);
+        $this->assertSame('INVALID', $role['code']);
+
+        $status = $app->useradminservice->set_status($owner, $customer, 'DELETED');
+        $this->assertFalse($status['ok']);
+        $this->assertSame('INVALID', $status['code']);
+    }
+
+    /* ========================= suspension behaviour ====================== */
+
+    public function testSuspendingACustomerRecordsTheChange()
+    {
+        list($app, $owner, , $customer) = $this->app();
+
+        $res = $app->useradminservice->set_status($owner, $customer, 'SUSPENDED', 'chargeback');
+
+        $this->assertTrue($res['ok'], $res['error'] ?? '');
+        $this->assertSame('ACTIVE', $res['before']['status']);
+        $this->assertSame('SUSPENDED', $res['after']['status']);
+        $this->assertSame('SUSPENDED', $app->User_model->find_by_id($customer->id)->status);
+    }
+
+    /* ====================== manual wallet adjustments ==================== */
+
+    /**
+     * A goodwill credit is a real ledger movement, not a balance write.
+     *
+     * If this screen ever wrote `wallets.balance` directly the balance would
+     * look right and the ledger would no longer sum to it — the single worst
+     * outcome for an accounting system, because it is invisible until an
+     * audit.
+     */
+    public function testAGoodwillCreditGoesThroughTheLedger()
+    {
+        list($app, $owner, , $customer) = $this->app('5000');
+        $opening = $app->balance($customer);
+
+        $res = $app->useradminservice->adjust_wallet(
+            $owner, $customer, '1500', 'CREDIT', 'goodwill for failed order');
+
+        $this->assertTrue($res['ok'], $res['error'] ?? '');
+        $this->assertSame(bcadd($opening, '1500.00000000', 8), $app->balance($customer));
+
+        list($debits, $credits) = $app->ledger_is_balanced();
+        $this->assertSame($debits, $credits, 'a manual adjustment must stay double-entry');
+    }
+
+    /** The movement must be attributable: who did it, and why. */
+    public function testAnAdjustmentRecordsTheActorAndTheReason()
+    {
+        list($app, $owner, , $customer) = $this->app();
+
+        $app->useradminservice->adjust_wallet(
+            $owner, $customer, '250', 'CREDIT', 'apology credit');
+
+        $rows = array_values(array_filter($app->rows('wallet_transactions'),
+            function ($r) { return ($r['type'] ?? '') === 'ADJUSTMENT'; }));
+
+        $this->assertCount(1, $rows);
+        $this->assertSame((int)$owner->id, (int)$rows[0]['actor_id'],
+            'an unattributed balance change is indistinguishable from theft');
+        $this->assertSame('apology credit', $rows[0]['note']);
+    }
+
+    /** An unexplained balance change is refused outright. */
+    public function testAnAdjustmentRequiresAReason()
+    {
+        list($app, $owner, , $customer) = $this->app();
+        $opening = $app->balance($customer);
+
+        $res = $app->useradminservice->adjust_wallet($owner, $customer, '100', 'CREDIT', '   ');
+
+        $this->assertFalse($res['ok']);
+        $this->assertSame('NO_REASON', $res['code']);
+        $this->assertSame($opening, $app->balance($customer));
+    }
+
+    /**
+     * A clawback cannot drive a wallet negative.
+     *
+     * The balance floor is enforced by LedgerService for every movement; this
+     * proves the manual path is not exempt from it.
+     */
+    public function testAClawbackCannotOverdrawTheWallet()
+    {
+        list($app, $owner, , $customer) = $this->app('1000');
+
+        $res = $app->useradminservice->adjust_wallet(
+            $owner, $customer, '5000', 'DEBIT', 'reversing a mistaken credit');
+
+        $this->assertFalse($res['ok']);
+        $this->assertSame('INSUFFICIENT', $res['code']);
+        $this->assertSame('1000.00000000', $app->balance($customer),
+            'a refused debit must leave the balance untouched');
+    }
+
+    public function testAClawbackWithinTheBalanceSucceeds()
+    {
+        list($app, $owner, , $customer) = $this->app('1000');
+
+        $res = $app->useradminservice->adjust_wallet(
+            $owner, $customer, '400', 'DEBIT', 'reversing a mistaken credit');
+
+        $this->assertTrue($res['ok'], $res['error'] ?? '');
+        $this->assertSame('600.00000000', $app->balance($customer));
+        list($debits, $credits) = $app->ledger_is_balanced();
+        $this->assertSame($debits, $credits);
+    }
+
+    /**
+     * A double-submitted form must not pay twice.
+     *
+     * The view emits one nonce per render, so the second POST carries the same
+     * idempotency key and is absorbed.
+     */
+    public function testAResubmittedAdjustmentIsAppliedOnce()
+    {
+        list($app, $owner, , $customer) = $this->app('1000');
+        $key = 'admin:adjust:'.$customer->id.':fixed-nonce';
+
+        $first  = $app->useradminservice->adjust_wallet($owner, $customer, '300', 'CREDIT', 'goodwill', $key);
+        $second = $app->useradminservice->adjust_wallet($owner, $customer, '300', 'CREDIT', 'goodwill', $key);
+
+        $this->assertTrue($first['ok'], $first['error'] ?? '');
+        $this->assertFalse($second['ok'], 'the repeat must not be reported as a fresh adjustment');
+        $this->assertSame('DUPLICATE', $second['code']);
+        $this->assertSame('1300.00000000', $app->balance($customer),
+            'the customer must be paid exactly once');
+    }
+
+    public function testAZeroOrNonNumericAmountIsRejected()
+    {
+        list($app, $owner, , $customer) = $this->app();
+        foreach (array('0', '-50', '', 'abc') as $bad) {
+            $res = $app->useradminservice->adjust_wallet($owner, $customer, $bad, 'CREDIT', 'why not');
+            $this->assertFalse($res['ok'], "amount '{$bad}' must be refused");
+            $this->assertSame('INVALID', $res['code']);
+        }
+        $this->assertSame('5000.00000000', $app->balance($customer));
+    }
+
+    /* ============================= directory ============================= */
+
+    public function testTheDirectorySearchesAndScopesToCustomers()
+    {
+        list($app, , , ) = $this->app();
+
+        $all = $app->useradminservice->grid(array('customers_only' => true));
+        $this->assertSame(1, (int)$all['total'], 'staff must not appear in the customer directory');
+        $this->assertSame('cust1', $all['rows'][0]->username);
+
+        $hit = $app->useradminservice->grid(array('search' => 'cust@'));
+        $this->assertSame(1, (int)$hit['total']);
+
+        $miss = $app->useradminservice->grid(array('search' => 'nobody@nowhere'));
+        $this->assertSame(0, (int)$miss['total']);
+    }
+
+    public function testTheDirectoryNeverSelectsCredentials()
+    {
+        list($app, , , ) = $this->app();
+        $row = $app->useradminservice->grid(array('customers_only' => true))['rows'][0];
+        $cols = array_keys(get_object_vars($row));
+
+        foreach (array('password_hash', 'mfa_secret') as $secret) {
+            $this->assertNotContains($secret, $cols,
+                'the directory must not read '.$secret.' — a screen cannot leak a column it never selects');
+        }
+    }
+
+    public function testTheProfileCarriesTheWallet()
+    {
+        list($app, , , $customer) = $this->app('750');
+        $profile = $app->useradminservice->profile($customer->public_id);
+
+        $this->assertNotNull($profile);
+        $this->assertSame('750.00000000', $profile->wallet->balance);
+        $this->assertNull($app->useradminservice->profile('NOPE'));
+    }
+
+    /* ======================= controller guarantees ======================= */
+
+    public function testTheUsersControllerNeverMovesMoneyItself()
+    {
+        $src = file_get_contents(self::$root.'/application/controllers/admin/Users.php');
+        foreach (array('ledgerservice->', "update('wallets'", "insert('wallet_transactions'") as $write) {
+            $this->assertStringNotContainsString($write, $src,
+                'admin/Users.php must delegate money to the service layer, found '.$write);
+        }
+    }
+
+    /**
+     * Suspending an account is support work; becoming the customer is not.
+     * The screen must never read credentials or session material.
+     */
+    public function testTheUsersScreenNeverTouchesCredentials()
+    {
+        $files = array(
+            self::$root.'/application/controllers/admin/Users.php',
+            self::$root.'/application/views/admin/users/index.php',
+            self::$root.'/application/views/admin/users/detail.php',
+            self::$root.'/application/views/admin/users/wallets.php',
+        );
+        foreach ($files as $f) {
+            $src = file_get_contents($f);
+            // `api_key_encrypted` rather than `api_key`: staff may *revoke* a
+            // customer's keys (Users::revoke_keys), which names the concept —
+            // what must never appear is the stored credential itself.
+            foreach (array('password_hash', 'mfa_secret', 'api_key_encrypted', 'set_userdata') as $forbidden) {
+                $this->assertStringNotContainsString($forbidden, $src,
+                    basename($f).' must not touch '.$forbidden);
+            }
+        }
+    }
+
+    public function testAdjustmentIsGatedOnItsOwnPermission()
+    {
+        $src = file_get_contents(self::$root.'/application/controllers/admin/Users.php');
+        // Reading a customer file and reaching into their wallet are
+        // different levels of trust.
+        $this->assertStringContainsString("require_perm('users.view')", $src);
+        $this->assertStringContainsString("'wallets.adjust'", $src);
+        $this->assertStringContainsString("'staff.manage'", $src);
+        $this->assertStringContainsString("'users.edit'", $src);
+    }
+
+    /**
+     * Regression: Admin → Customers used to issue a signed reset token, skip
+     * MailService entirely, and flash "emailed". No queue row meant there was
+     * nothing a cron worker could ever deliver.
+     */
+    public function testAdminPasswordResetActuallyQueuesTheStandardTemplate()
+    {
+        $controller = file_get_contents(self::$root.'/application/controllers/admin/Users.php');
+        $mail = file_get_contents(self::$root.'/application/libraries/MailService.php');
+
+        $this->assertStringContainsString('enqueue_password_reset(', $controller);
+        $this->assertStringContainsString('password_reset_queue_failed', $controller,
+            'a failed queue insert must not be reported as a sent message');
+        $this->assertStringContainsString("'auth.password_reset'", $mail);
+        $this->assertStringContainsString("site_url('reset-password/' . \$token)", $mail);
+        $this->assertStringContainsString("'reset_url'", $mail);
+    }
+
+    /* ===================== administrator creation ======================== */
+
+    /**
+     * Admin → Administrators → Add: minting a colleague. The account must be
+     * complete (usable password, wallet row, verified address vouched for by
+     * the operator) and the audit row must name the creator and the role —
+     * but never the password.
+     */
+    public function testAnAdminCreatesAnotherAdministrator()
+    {
+        list($app, $owner, , ) = $this->app();
+
+        $res = $app->useradminservice->create_admin($owner, array(
+            'username' => 'ops1', 'email' => 'OPS1@x.test',
+            'password' => 'Hand-Over-Privately-9', 'role' => 'admin',
+        ));
+
+        $this->assertTrue($res['ok'], $res['error'] ?? '');
+        $row = $app->User_model->find_by_username('ops1');
+        $this->assertNotNull($row);
+        $this->assertSame('ADMIN', $row->role, 'the role is upper-cased, not trusted');
+        $this->assertSame('ACTIVE', $row->status);
+        $this->assertSame('ops1@x.test', $row->email, 'the address is stored lower-case');
+        $this->assertNotNull($row->email_verified_at, 'the creating operator vouched for the address');
+        $this->assertTrue(password_verify('Hand-Over-Privately-9', $row->password_hash),
+            'the password verifies with the panel\'s normal hasher');
+
+        // Same shape as every other account: the user file and ledger queries
+        // never have to special-case an administrator without a wallet.
+        $wallet = $app->Wallet_model->for_user($row->id);
+        $this->assertNotNull($wallet);
+        $this->assertSame('0.00000000', (string)$wallet->balance);
+
+        $audit = $app->db->where('action', 'staff.admin_created')
+            ->where('resource_id', $row->public_id)->get('audit_logs')->row();
+        $this->assertNotNull($audit, 'creation is audited');
+        $this->assertSame((int)$owner->id, (int)$audit->actor_id);
+        $this->assertStringContainsString('"role":"ADMIN"', (string)$audit->after_json);
+        $this->assertStringNotContainsString('Hand-Over-Privately-9', (string)$audit->after_json,
+            'the audit row must never carry the password');
+    }
+
+    /** Every way the mint can go wrong, and none of them half-create a row. */
+    public function testAdminCreationRejectsBadInputAndDuplicates()
+    {
+        list($app, $owner, $admin, ) = $this->app();
+
+        $cases = array(
+            'duplicate username' => array(
+                'username' => 'owner', 'email' => 'new@x.test',
+                'password' => 'Str0ng!pass2', 'role' => 'ADMIN'),
+            'duplicate email' => array(
+                'username' => 'newuser', 'email' => 'owner@x.test',
+                'password' => 'Str0ng!pass2', 'role' => 'ADMIN'),
+            'short password' => array(
+                'username' => 'newuser', 'email' => 'new@x.test',
+                'password' => 'short', 'role' => 'ADMIN'),
+            'bad username' => array(
+                'username' => 'not allowed!', 'email' => 'new@x.test',
+                'password' => 'Str0ng!pass2', 'role' => 'ADMIN'),
+            'bad email' => array(
+                'username' => 'newuser', 'email' => 'not-an-email',
+                'password' => 'Str0ng!pass2', 'role' => 'ADMIN'),
+            'customer role is not mintable here' => array(
+                'username' => 'newuser', 'email' => 'new@x.test',
+                'password' => 'Str0ng!pass2', 'role' => 'CUSTOMER'),
+        );
+        foreach ($cases as $label => $input) {
+            $res = $app->useradminservice->create_admin($owner, $input);
+            $this->assertFalse($res['ok'], $label.' must be refused');
+            $this->assertNotNull($res['code'], $label.' must carry a code');
+        }
+
+        // An ADMIN cannot mint a SUPER_ADMIN — the same rule as set_role().
+        $escalation = $app->useradminservice->create_admin($admin, array(
+            'username' => 'owner2', 'email' => 'owner2@x.test',
+            'password' => 'Str0ng!pass2', 'role' => 'SUPER_ADMIN'));
+        $this->assertFalse($escalation['ok']);
+        $this->assertSame('FORBIDDEN', $escalation['code']);
+        $this->assertNull($app->User_model->find_by_username('owner2'));
+
+        // Only staff may create administrators at all.
+        $customer = $app->register('cust2', 'cust2@x.test');
+        $this->assertSame('FORBIDDEN',
+            $app->useradminservice->create_admin($customer, array(
+                'username' => 'hacker', 'email' => 'hacker@x.test',
+                'password' => 'Str0ng!pass2', 'role' => 'ADMIN'))['code']);
+
+        $this->assertSame(0, $app->db->count('audit_logs'),
+            'a refused creation writes no audit row');
+    }
+
+    /** The screen and route exist, and the form's role menu matches the guard. */
+    public function testAdministratorCreationIsWiredIntoTheScreen()
+    {
+        $controller = file_get_contents(self::$root.'/application/controllers/admin/Staff.php');
+        $view = file_get_contents(self::$root.'/application/views/admin/staff/administrators.php');
+        $routes = file_get_contents(self::$root.'/application/config/routes.php');
+
+        $this->assertStringContainsString('function create()', $controller);
+        $this->assertStringContainsString('create_admin(', $controller);
+        $this->assertStringContainsString("admin/administrators/create'] = 'admin/staff/create'", $routes);
+        $this->assertStringContainsString('admin/administrators/create', $view);
+        // The SUPER_ADMIN option is rendered only for a SUPER_ADMIN, matching
+        // the service-side guard.
+        $this->assertStringContainsString("current_user->role === 'SUPER_ADMIN'", $view);
+        $this->assertStringContainsString('value="SUPER_ADMIN"', $view);
+        $this->assertStringContainsString('value="ADMIN"', $view);
+        $this->assertStringContainsString('minlength="8"', $view);
+    }
+
+    /* ==================== admin-set customer password ==================== */
+
+    /**
+     * The operator's counter case: a customer on the phone who cannot open
+     * mail needs a credential read back to them, so staff holding users.edit
+     * may SET the password from the customer file — POST-only, customer-role
+     * targets only, audited without the secret, and the customer notified.
+     */
+    public function testAdminSetCustomerPasswordIsWiredWithItsGuards()
+    {
+        $routes     = file_get_contents(self::$root.'/application/config/routes.php');
+        $controller = file_get_contents(self::$root.'/application/controllers/admin/Users.php');
+        $service    = file_get_contents(self::$root.'/application/libraries/AuthService.php');
+        $view       = file_get_contents(self::$root.'/application/views/admin/users/detail.php');
+
+        $this->assertStringContainsString(
+            "admin/customers/(:any)/password'] = 'admin/users/set_password", $routes);
+        $this->assertStringContainsString('function set_password(', $controller);
+        $this->assertStringContainsString("guard(\$public_id, 'users.edit')", $controller,
+            'the direct set rides the same POST+permission guard as every mutation');
+        $this->assertStringContainsString("\$user->role !== 'CUSTOMER'", $controller,
+            'a staff credential must never be set from the customer file');
+        $this->assertStringContainsString('force_set_password(', $controller);
+        $this->assertStringContainsString("'user.password_set'", $controller,
+            'the change is attributed to the acting staff member');
+        $this->assertStringContainsString('notify_customer(', $controller,
+            'a password change the customer does not hear about is a silent takeover');
+
+        $this->assertStringContainsString('function force_set_password(', $service);
+        $this->assertStringContainsString('refresh_tokens', $service,
+            'sessions holding the old credential must die with the rotation');
+        $this->assertStringContainsString('hash_password(', $service);
+
+        $this->assertStringContainsString('name="new_password"', $view);
+        $this->assertStringContainsString('name="confirm_password"', $view);
+        $this->assertStringContainsString("/password')", $view, 'the form posts to the new route');
+        // The controller holds no hash column and the audit carries no secret:
+        // the file-level no-credentials scan above already pins both of these.
+    }
+
+    /**
+     * The behavioral contract of AuthService::force_set_password, exercised
+     * against the real harness (not a source scan): the hash rotates to the
+     * new credential, the old one stops verifying, an outstanding refresh
+     * session is revoked, and a short password is refused without touching
+     * anything.
+     */
+    public function testForceSetPasswordRotatesHashAndRevokesSessions()
+    {
+        list($app, , , $customer) = $this->app();
+        $old_hash = $app->db->where('id', $customer->id)->get('users')->row()->password_hash;
+        $this->assertTrue(password_verify('Str0ng!pass1', $old_hash), 'fixture sanity');
+
+        // An outstanding device session that must die with the rotation.
+        $app->db->insert('refresh_tokens', array(
+            'user_id'    => (int)$customer->id,
+            'token_hash' => hash('sha256', 'device-session-before'),
+            'expires_at' => gmdate('Y-m-d H:i:s', time() + 86400),
+            'revoked_at' => null,
+            'created_at' => gmdate('Y-m-d H:i:s'),
+        ));
+
+        $app->library('AuthService');
+
+        $short = $app->authservice->force_set_password($customer, 'short');
+        $this->assertFalse($short['ok']);
+        $this->assertTrue(password_verify('Str0ng!pass1',
+            $app->db->where('id', $customer->id)->get('users')->row()->password_hash),
+            'a refused change must not rotate anything');
+
+        $res = $app->authservice->force_set_password($customer, 'Counter-Set-99!');
+        $this->assertTrue($res['ok']);
+
+        $row = $app->db->where('id', $customer->id)->get('users')->row();
+        $this->assertTrue(password_verify('Counter-Set-99!', $row->password_hash),
+            'the new credential must sign in');
+        $this->assertFalse(password_verify('Str0ng!pass1', $row->password_hash),
+            'the old credential must stop working');
+
+        $rt = $app->db->where('user_id', $customer->id)->get('refresh_tokens')->row();
+        $this->assertNotNull($rt->revoked_at,
+            'the refresh session holding the old credential must be revoked');
+    }
+
+
+    /* ==================== customer account deletion ==================== */
+
+    /**
+     * Deleting is the one admin action that cannot be undone, so the wiring
+     * pins every guard in both layers: POST+permission at the controller,
+     * customer-role-only plus the ledger-untouched preconditions in the
+     * service, and the audit row that keeps who the account was.
+     */
+    public function testAccountDeletionIsWiredWithItsGuards()
+    {
+        $routes     = file_get_contents(self::$root.'/application/config/routes.php');
+        $controller = file_get_contents(self::$root.'/application/controllers/admin/Users.php');
+        $service    = file_get_contents(self::$root.'/application/libraries/UserAdminService.php');
+        $view       = file_get_contents(self::$root.'/application/views/admin/users/detail.php');
+
+        $this->assertStringContainsString(
+            "admin/customers/(:any)/delete'] = 'admin/users/delete", $routes);
+        $this->assertStringContainsString('function delete(', $controller);
+        $this->assertStringContainsString("'user.deleted'", $controller,
+            'an account that vanishes without an audit row is a silent removal');
+        $this->assertStringContainsString("redirect('admin/customers')", $controller,
+            'the customer file is gone with the row — success must land on the directory');
+
+        $this->assertStringContainsString('function delete_user(', $service);
+        $this->assertStringContainsString("(string)\$user->role !== 'CUSTOMER'", $service,
+            'a staff account must never be deletable from the customer file');
+        foreach (array("'HAS_FUNDS'", "'HAS_LEDGER'", "'HAS_ORDERS'", "'HAS_PAYMENTS'") as $code) {
+            $this->assertStringContainsString($code, $service,
+                'every form of money history must have its own named refusal');
+        }
+        $this->assertStringContainsString("count_all_results('order", $service);
+        $this->assertStringContainsString("count_all_results('wallet_transactions')", $service);
+        $this->assertStringContainsString('->delete(\'users\')', $service);
+
+        $this->assertStringContainsString("'/delete')?>", $view, 'the form posts to the delete route');
+        $this->assertStringContainsString('Delete account permanently', $view);
+        $this->assertStringContainsString('btn-danger', $view);
+    }
+
+    /**
+     * The behavioral contract, on the real harness: a never-used account
+     * disappears for good, while an account with a ledger movement or an
+     * order on record refuses and stays — and neither staff nor the actor
+     * themselves can be the target.
+     */
+    public function testOnlyLedgerUntouchedAccountsCanBeDeleted()
+    {
+        // A clean registration — the spam/duplicate/typo case — is gone for real.
+        $app = new IntegrationHarness();
+        $app->seed_minimal();
+        $admin = $app->register('admin1', 'admin@x.test', 'Str0ng!pass1', 'ADMIN');
+        $ghost = $app->register('ghost', 'ghost@x.test');
+        $app->library(array('LedgerService', 'UserAdminService'));
+        $app->model(array('User_model', 'Wallet_model', 'Wallet_transaction_model'));
+        $this->assertNotNull($app->db->where('id', $ghost->id)->get('users')->row(), 'fixture sanity');
+
+        $res = $app->useradminservice->delete_user($admin, $ghost);
+        $this->assertTrue($res['ok'], $res['ok'] ? '' : $res['error']);
+        $this->assertNull($app->db->where('id', $ghost->id)->get('users')->row(),
+            'deletion is a real removal — no ghost row left to sign in with');
+
+        // Money sitting in the wallet is the first refusal, whatever shape the history has.
+        list($app, , $admin, $customer) = $this->app('750'); // wallet credited
+        $res = $app->useradminservice->delete_user($admin, $customer);
+        $this->assertFalse($res['ok']);
+        $this->assertSame('HAS_FUNDS', $res['code']);
+
+        // Even spent to zero, one ledger movement makes the account part of the books forever.
+        $app->db->where('user_id', $customer->id)->update('wallets', array('balance' => '0.00000000'));
+        $res = $app->useradminservice->delete_user($admin, $customer);
+        $this->assertFalse($res['ok']);
+        $this->assertSame('HAS_LEDGER', $res['code']);
+        $this->assertNotNull($app->db->where('id', $customer->id)->get('users')->row(),
+            'a refused deletion must not half-apply');
+
+        // Same story for an order on record: suspend, never delete.
+        $app = new IntegrationHarness();
+        $app->seed_minimal();
+        $admin = $app->register('admin2', 'admin2@x.test', 'Str0ng!pass1', 'ADMIN');
+        $buyer = $app->register('buyer', 'buyer@x.test');
+        $app->library(array('LedgerService', 'UserAdminService'));
+        $app->model(array('User_model', 'Wallet_model', 'Wallet_transaction_model'));
+        $app->db->insert('orders', array(
+            'user_id' => (int)$buyer->id, 'service_id' => 1,
+            'link' => 'https://x.test/p', 'quantity' => 100,
+            'charge' => '2.00000000', 'rate_at_order' => '20.00000000',
+        ));
+        $res = $app->useradminservice->delete_user($admin, $buyer);
+        $this->assertFalse($res['ok']);
+        $this->assertSame('HAS_ORDERS', $res['code']);
+
+        // Neither yourself nor a colleague is a valid target.
+        $this->assertSame('SELF', $app->useradminservice->delete_user($admin, $admin)['code']);
+        $staff = $app->register('backup_admin', 'backup@x.test', 'Str0ng!pass1', 'STAFF');
+        $this->assertSame('STAFF',
+            $app->useradminservice->delete_user($admin, $staff)['code'],
+            'staff identities are removed by re-grading, never deleted from the customer file');
+    }
+
+}
