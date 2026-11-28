@@ -155,6 +155,10 @@ class WithdrawalRemovalTest extends TestCase
             // section; the reseller half is asserted clean separately above.
             'application/views/api/docs.php',
         );
+        // Prestmit's read-only PARTNER treasury API has an upstream history
+        // path containing the word. It never implements customer cash-out.
+        // PrestmitTreasuryTest pins GET-only transport and unchanged ledgers.
+        $copy_only[] = 'application/libraries/PrestmitAdapter.php';
         $copy_only = array_merge($copy_only, $earnings_payouts);
         $clean = array(
             'application/controllers', 'application/core', 'application/libraries',

@@ -173,11 +173,15 @@ class DashboardTest extends TestCase
     {
         foreach (glob(self::$root.'/application/views/dashboard/**/*.php') as $file) {
             $src = file_get_contents($file);
-            // Component classes (not just raw utilities) should be used.
-            $this->assertTrue(
-                strpos($src, 'card') !== false || strpos($src, 'btn') !== false,
-                basename($file).' should use design-system components'
-            );
+            // Component classes apply to rendered UI, not script-only partials.
+            // Keep the secret/CSRF checks below active for every file.
+            $markup = preg_replace('/<script\b[^>]*>.*?<\/script>/is', '', $src);
+            if (preg_match('/<(div|section|form|article|main|button|input|select|a)\b/i', $markup)) {
+                $this->assertTrue(
+                    strpos($src, 'card') !== false || strpos($src, 'btn') !== false,
+                    basename($file).' should use design-system components'
+                );
+            }
             // No password/secret leakage.
             $this->assertStringNotContainsString('password_hash', $src);
             $this->assertStringNotContainsString('api_key_encrypted', $src);

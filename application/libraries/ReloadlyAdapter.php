@@ -115,6 +115,11 @@ class ReloadlyAdapter implements GiftcardProviderInterface {
 
     /* -------------------------------- order ------------------------------- */
 
+    public function configured() {
+        $c = $this->credentials();
+        return trim($c['client_id']) !== '' && trim($c['client_secret']) !== '';
+    }
+
     public function order(array $p) {
         $product_id = (string)($p['product_id'] ?? '');
         $quantity   = max(1, (int)($p['quantity'] ?? 1));

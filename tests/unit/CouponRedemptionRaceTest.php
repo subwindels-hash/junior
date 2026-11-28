@@ -231,6 +231,31 @@ class CouponRedemptionRaceTest extends TestCase
         $this->assertSame(0, $this->times_used($app, $coupon));
     }
 
+    public function testRepeatedReleaseCannotEraseAnotherCustomersGlobalUsage() {
+        list($app, $user) = $this->app();
+        $other = $app->register('other_coupon_user', 'other-coupon@example.test');
+        $coupon = $this->coupon($app);
+        $first = $app->Coupon_model->reserve_redemption($coupon, $user->id);
+        $second = $app->Coupon_model->reserve_redemption($coupon, $other->id);
+        $this->assertTrue($first['ok']); $this->assertTrue($second['ok']);
+        $this->assertSame(2, $this->times_used($app, $coupon));
+        $this->assertTrue($app->Coupon_model->release_redemption($first['id'], $coupon->id));
+        $this->assertTrue($app->Coupon_model->release_redemption($first['id'], $coupon->id));
+        $this->assertSame(1, $this->times_used($app, $coupon));
+        $this->assertCount(1, $this->rows($app, $coupon, $other));
+    }
+
+    public function testReleaseRejectsTheWrongCouponHintWithoutChangingEitherCoupon() {
+        list($app, $user) = $this->app();
+        $first = $this->coupon($app, array('code' => 'FIRST'));
+        $second = $this->coupon($app, array('code' => 'SECOND'));
+        $reservation = $app->Coupon_model->reserve_redemption($first, $user->id);
+        $this->assertFalse($app->Coupon_model->release_redemption($reservation['id'], $second->id));
+        $this->assertCount(1, $this->rows($app, $first, $user));
+        $this->assertSame(1, $this->times_used($app, $first));
+        $this->assertSame(0, $this->times_used($app, $second));
+    }
+
     /**
      * The compatibility wrapper still works, and now answers the question the
      * race could not: false when the limit is already taken.

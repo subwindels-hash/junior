@@ -218,6 +218,25 @@ $search = $search ?? '';
       </label>
     </details>
     <details class="text-sm muted">
+      <summary>Prestmit partner API (PRESTMIT only)</summary>
+      <p class="text-xs muted" style="margin-top:.5rem">
+        Gift-card buying and opt-in digital e-code selling. Request approved partner access from Prestmit first.
+        Start with <span class="mono">https://dev-api.prestmit.io/partners/v1</span>;
+        live: <span class="mono">https://api.prestmit.io/partners/v1</span>.
+        Use the partner API key above, not your login password. All three credentials
+        are encrypted together and never displayed. The panel base currency must be NGN or GHS.
+      </p>
+      <label class="field"><span class="label">Prestmit API secret</span>
+        <input class="input" type="password" name="prestmit_api_secret" autocomplete="new-password">
+      </label>
+      <label class="field"><span class="label">Prestmit account PIN</span>
+        <input class="input" type="password" name="prestmit_account_pin" inputmode="numeric" pattern="[0-9]{4,6}" autocomplete="new-password">
+      </label>
+      <p class="text-xs muted">Confirm automated debit permissions and your 2FA policy with Prestmit.
+        Catalogue imports are inactive and unpriced; review them in Admin → Gift cards.
+        Selling requires PRESTMIT_SELL_ENABLED and an NGN wallet/provider. eSIM, crypto, VTU and bank payouts are not enabled here.</p>
+    </details>
+    <details class="text-sm muted">
       <summary>Advanced</summary>
       <div class="row" style="gap:.75rem;margin-top:.5rem">
         <label class="field" style="flex:1"><span class="label">Percentage increase</span>

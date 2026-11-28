@@ -56,8 +56,8 @@ class TransactionEngine {
      *
      * One helper because the sequence is the contract (module 36, copied from
      * the shop checkout that has carried it since module 18): quote → reserve
-     * the slot BEFORE anything charges → charge the discounted amount →
-     * attach on success / release when the customer's money came back. A
+     * the slot BEFORE anything charges → link it to the purchase → charge
+     * the discounted amount / release only once failure or full refund commits. A
      * coupon whose redemption slot cannot be taken refuses the purchase while
      * nothing has moved, which is the only safe order.
      *
@@ -224,6 +224,22 @@ class TransactionEngine {
             call_user_func($spec['detail'], $tx_id);
         }
 
+        // Link the reserved slot BEFORE any charge or provider call. A crash
+        // or uncertain upstream outcome must retain a durable coupon owner.
+        if ($coupon_reservation) {
+            $this->ci->load->model('Coupon_model');
+            try {
+                $linked = $this->ci->Coupon_model->attach_redemption($coupon_reservation['id'], null,
+                    $coupon_discount, (string)$spec['service_domain'],
+                    $this->ci->Service_transaction_model->find_by_id($tx_id)->public_id);
+            } catch (Throwable $e) { $linked = false; }
+            if (!$linked) {
+                $this->transition($tx_id, 'FAILED', 'SYSTEM', 'Coupon reservation could not be linked', array('refund' => false));
+                $this->release_coupon($coupon_reservation);
+                return $this->fail_result('Could not secure the coupon reservation. Nothing was charged.', 'COUPON_FAILED');
+            }
+        }
+
         // 3. Charge. LedgerService is idempotent and holds the row lock.
         //    A 100%-off coupon skips the ledger entry entirely: a zero-value
         //    wallet row is noise, not accounting.
@@ -252,8 +268,8 @@ class TransactionEngine {
         }
         $this->transition($tx_id, 'PROCESSING', 'SYSTEM', null, array('refund' => false));
 
-        // 4. Provider call. Anything thrown here is a failed purchase the
-        //    customer has already paid for, so it must refund like a rejection.
+        // 4. Provider call. A failure requests a refund, but uncertain Prestmit
+        // purchases may remain PROCESSING. Never assume a transition succeeded.
         $tx = $this->ci->Service_transaction_model->find_by_id($tx_id);
         try {
             $result = call_user_func($spec['dispatch'], $tx);
@@ -267,15 +283,10 @@ class TransactionEngine {
             // stack trace, and both are now handled.
             log_message('error', 'TransactionEngine dispatch threw: '.$e->getMessage());
             $this->transition($tx_id, 'FAILED', 'PROVIDER', 'Provider error');
-            // The customer was refunded above, so the discount was never
-            // enjoyed: give the coupon slot back rather than burning the
-            // customer's single use of it on a purchase that did not happen.
-            if ($coupon_reservation) $this->release_coupon($coupon_reservation);
             return $this->fail_result('The provider could not be reached', 'PROVIDER_ERROR');
         }
         if (!is_array($result)) {
             $this->transition($tx_id, 'FAILED', 'PROVIDER', 'Malformed provider response');
-            if ($coupon_reservation) $this->release_coupon($coupon_reservation);
             return $this->fail_result('The provider returned an unusable response', 'PROVIDER_ERROR');
         }
 
@@ -289,7 +300,6 @@ class TransactionEngine {
         if (empty($result['ok'])) {
             $reason = isset($result['error']) ? $result['error'] : 'Provider rejected the request';
             $this->transition($tx_id, 'FAILED', 'PROVIDER', $reason);
-            if ($coupon_reservation) $this->release_coupon($coupon_reservation);
             return $this->fail_result($reason, 'PROVIDER_REJECTED');
         }
 
@@ -300,19 +310,6 @@ class TransactionEngine {
         }
         if ($final === 'SUCCESSFUL') {
             $this->transition($tx_id, 'SUCCESSFUL', 'PROVIDER');
-        }
-
-        // The coupon slot only becomes a redemption once the purchase has
-        // actually landed — the same moment the shop checkout attaches its
-        // own reservation. The reference is the transaction's public_id, the
-        // one identifier the customer can see on their receipt.
-        if ($coupon_reservation) {
-            $this->ci->load->model('Coupon_model');
-            $this->ci->Coupon_model->attach_redemption(
-                $coupon_reservation['id'], null, $coupon_discount,
-                (string)$spec['service_domain'],
-                $this->ci->Service_transaction_model->find_by_id($tx_id)->public_id
-            );
         }
 
         return array(
@@ -378,6 +375,17 @@ class TransactionEngine {
                     'code' => 'NOT_ALLOWED');
             }
 
+            // Shared financial boundary: admin, recovery, exception and domain
+            // callers must all obey the same Prestmit reconciliation policy.
+            if ($tx->service_domain === 'GIFTCARD' && ($from !== 'PENDING' || !empty($tx->wallet_transaction_id))
+                && in_array($new_status, self::$refunding_states, true)) {
+                $blocked = $this->giftcard_refund_block($tx);
+                if ($blocked !== null) {
+                    $this->ci->db->trans_rollback();
+                    return array('ok' => false, 'error' => $blocked, 'code' => 'RECONCILIATION_REQUIRED');
+                }
+            }
+
             $fields = array('status' => $new_status);
             if (in_array($new_status, self::$terminal_states, true)
                 || in_array($new_status, self::$settled_states, true)) {
@@ -428,6 +436,31 @@ class TransactionEngine {
                 return array('ok' => false, 'error' => 'Transaction status changed concurrently', 'code' => 'CONFLICT');
             }
             $this->record_status($tx->id, $from, $new_status, $source, $reason);
+            // Coupon release is part of the same transaction as the successful
+            // failure/refund. Unknown outcomes, partial refunds and completed
+            // goodwill refunds keep their usage. No second release in execute().
+            $meta = json_decode((string)($tx->metadata ?? ''), true) ?: array();
+            $refunded_total = $fields['refunded_amount'] ?? $already;
+            if (!empty($meta['coupon_code']) && in_array($from, array('PENDING', 'PROCESSING'), true)
+                && in_array($new_status, self::$refunding_states, true)
+                && ((empty($tx->wallet_transaction_id) && $from === 'PENDING')
+                    || bccomp($refunded_total, $this->money($tx->amount), 8) >= 0)) {
+                $this->ci->load->model('Coupon_model');
+                foreach ($this->ci->Coupon_model->for_reference($tx->service_domain, $tx->public_id) as $redemption) {
+                    if ((int)$redemption->user_id !== (int)$tx->user_id
+                        || !$this->ci->Coupon_model->release_redemption($redemption->id, $redemption->coupon_id)) {
+                        throw new RuntimeException('Could not release the purchase coupon.');
+                    }
+                }
+            }
+
+            if ($tx->service_domain === 'GIFTCARD' && in_array($new_status, self::$refunding_states, true)) {
+                $this->ci->load->model('Giftcard_order_model');
+                if (!$this->ci->Giftcard_order_model->update_for_transaction($tx->id, array('status' => 'FAILED'))) {
+                    throw new RuntimeException('Could not close gift-card order.');
+                }
+            }
+
 
             if ($this->ci->db->trans_status() === false || !$this->ci->db->trans_commit()) {
                 $this->ci->db->trans_rollback();
@@ -454,6 +487,33 @@ class TransactionEngine {
             log_message('error', 'TransactionEngine transition failed: '.$e->getMessage());
             return array('ok' => false, 'error' => 'Transaction could not be updated', 'code' => 'DB_ERROR');
         }
+    }
+
+    /** Called only with the service transaction row locked. */
+    private function giftcard_refund_block($tx) {
+        $this->ci->load->model(array('Provider_model', 'Giftcard_order_model', 'Giftcard_code_model'));
+        $order = $this->ci->Giftcard_order_model->for_transaction($tx->id);
+        $provider = $tx->provider_id ? $this->ci->Provider_model->find_by_id($tx->provider_id) : null;
+        if (!$provider) return 'The gift-card provider identity is missing; reconcile before refunding.';
+        $meta = json_decode((string)($tx->metadata ?? ''), true) ?: array();
+        if (($meta['provider_api_type'] ?? '') === 'PRESTMIT'
+            && ($provider->api_type !== 'PRESTMIT' || ($meta['provider_url'] ?? '') !== rtrim($provider->api_url, '/'))) {
+            return 'Provider identity changed; restore its original environment before reconciliation.';
+        }
+        if (strtoupper($provider->api_type) !== 'PRESTMIT') return null;
+        if ($order && ($order->status === 'DELIVERED'
+            || $this->ci->Giftcard_code_model->count_for_order($order->id) > 0)) {
+            return 'Issued gift-card codes cannot be refunded automatically.';
+        }
+        // A definitive pre-acceptance rejection has no provider reference.
+        if ($order && $order->status === 'FAILED' && empty($tx->provider_reference)
+            && empty($order->provider_order_id)) return null;
+        $reference = $order && $order->provider_order_id ? $order->provider_order_id : $tx->provider_reference;
+        if (!$reference) $reference = 'prestmit-pending:'.$tx->public_id;
+        $this->ci->load->library('Provider_manager');
+        $res = $this->ci->provider_manager->adapter($provider, 'GIFTCARD')->order_status($reference);
+        return !empty($res['ok']) && in_array($res['status'] ?? '', array('FAILED', 'REFUNDED'), true)
+            ? null : 'Prestmit has not confirmed failure or refund; this purchase requires reconciliation.';
     }
 
     /* -------------------------------------------------------------------- */

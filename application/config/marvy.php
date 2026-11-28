@@ -65,6 +65,12 @@ $config['giftcard_countries'] = env_str('GIFTCARD_COUNTRIES', 'US,GB,NG');
    then, so this number is a real cost/patience trade-off, not a timeout. */
 $config['giftcard_give_up_minutes'] = 60;
 
+// Opt-in customer e-code sales. Credentials remain in Admin → Providers.
+$config['prestmit_sell_enabled'] = env_bool('PRESTMIT_SELL_ENABLED', false);
+$config['prestmit_sell_provider_id'] = (int)env_str('PRESTMIT_SELL_PROVIDER_ID', '0');
+$config['prestmit_sell_margin_percent'] = env_str('PRESTMIT_SELL_MARGIN_PERCENT', '5');
+
+
 /* Where cron jobs keep their exclusive lock files (see JobRunner). */
 $config['cron_lock_dir'] = sys_get_temp_dir().'/marvy-locks';
 
@@ -75,6 +81,7 @@ $config['cron'] = array(
     'numbers_status'         => '* * * * *',
     'identity_purge'         => '30 3 * * *',
     'giftcard_codes'         => '*/2 * * * *',
+    'giftcard_sales'         => '*/2 * * * *',
     // Closes purchases no domain worker can settle (no provider reference, or
     // a provider that stopped answering) and returns the money.
     'service_recovery'       => '*/10 * * * *',
@@ -111,3 +118,8 @@ $config['cron'] = array(
     // Runs every 15 minutes so a PIN is never overdue by more than that.
     'pin_rotation' => '*/15 * * * *',
 );
+
+// Per-provider webhook keys from Prestmit's console (NOT API secrets). Never log.
+$config['prestmit_webhook_secrets'] = json_decode(env_str('PRESTMIT_WEBHOOK_SECRETS', '{}'), true) ?: array();
+
+$config['prestmit_physical_enabled'] = env_bool('PRESTMIT_PHYSICAL_ENABLED', false);

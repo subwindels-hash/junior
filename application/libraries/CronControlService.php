@@ -44,6 +44,7 @@ class CronControlService {
      * customer-visible consequence they should read first.
      */
     const MONEY_JOBS = array(
+        'giftcard_sales'         => 'Completed gift-card sales are not reconciled or credited to customer wallets.',
         'payment_reconciliation' => 'Deposits whose callback never arrived stay PENDING; nobody is credited.',
         'earnings_release'       => 'Referral earnings stay held and cannot be withdrawn.',
         'service_recovery'       => 'Purchases stuck with no provider reference are not refunded.',

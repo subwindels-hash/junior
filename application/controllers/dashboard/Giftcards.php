@@ -65,9 +65,9 @@ class Giftcards extends Auth_Controller {
 
         if (empty($result['ok'])) {
             $this->session->set_flashdata('error', $result['error']);
-            // A rejected order that still produced a transaction has a receipt
-            // worth showing — it was refunded, and the customer should see
-            // that rather than a red banner on an empty form.
+            // A recorded purchase always has a receipt worth showing. It may
+            // be refunded OR still awaiting reconciliation; never send the
+            // customer back to an empty form that invites a second purchase.
             if (!empty($result['transaction'])) {
                 return redirect('dashboard/giftcards/'.$result['transaction']->public_id);
             }

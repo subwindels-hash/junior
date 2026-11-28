@@ -166,10 +166,14 @@ copy assets
 copy cron
 copy database/marvysocials.sql
 copy database/upgrade-042-deposit-currency.sql
+copy database/upgrade-046-prestmit.sql
 copy database/upgrade-branding-active-digital-hub.sql
 copy database/schema_verification.php
 copy database/README.md
 copy docs/cpanel-deployment.md
+copy docs/module-prestmit-provider.md
+copy docs/module-prestmit-sell.md
+copy docs/prestmit-completion-audit.md
 
 # Full composer vendor/ when present (production dependencies). Copied first
 # so the explicit framework materialisation below can overwrite any symlink
@@ -216,7 +220,7 @@ fi
 # request anyway, but only where the document root happens to be writable.
 say "creating runtime directories"
 for dir in storage/logs storage/cache storage/cache/sessions storage/cache/ratelimit \
-           storage/ticket_attachments application/cache assets/uploads; do
+           storage/ticket_attachments storage/giftcard_images application/cache assets/uploads; do
   mkdir -p "${STAGE}/${dir}"
 done
 for dir in storage/logs storage/cache storage/cache/sessions storage/cache/ratelimit \
@@ -239,6 +243,8 @@ done
 # clone must not disagree about how it is protected.
 cp "${ROOT}/storage/ticket_attachments/.htaccess" "${STAGE}/storage/ticket_attachments/.htaccess"
 cp "${ROOT}/storage/ticket_attachments/index.html" "${STAGE}/storage/ticket_attachments/index.html"
+cp "${ROOT}/storage/giftcard_images/.htaccess" "${STAGE}/storage/giftcard_images/.htaccess"
+cp "${ROOT}/storage/giftcard_images/index.html" "${STAGE}/storage/giftcard_images/index.html"
 
 # assets/uploads is runtime data, never deployment payload: whatever the
 # build machine's uploads directory happens to hold (a dev preview's test
@@ -359,6 +365,7 @@ EXISTING INSTALLATION UPDATE (preserves all live data)
    3. In phpMyAdmin select the EXISTING database and import:
          database/upgrade-042-deposit-currency.sql (if not already applied)
          database/upgrade-branding-active-digital-hub.sql
+         database/upgrade-046-prestmit.sql (only from schema 044/045; otherwise migrate latest)
       Do NOT import marvysocials.sql over a live database; that file is the
       complete new-install database and includes seed records.
    4. Open /deploy-verify.php. When every check is green, delete that file.

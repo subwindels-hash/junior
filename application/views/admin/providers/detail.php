@@ -75,6 +75,9 @@ $has = function ($permission) use ($permissions) {
       </p>
       <?php endif; ?>
       <?php endif; ?>
+      <?php if ($p->api_type === 'PRESTMIT' && $has('providers.manage')): ?>
+      <a class="btn btn-secondary btn-sm mt-3" href="<?=site_url('admin/providers/'.$p->public_id.'/treasury')?>">View treasury (read only)</a>
+      <?php endif; ?>
       <?php if ($has('providers.manage')): ?>
       <div class="row mt-3" style="justify-content:flex-end;gap:.5rem">
         <button class="btn btn-secondary btn-sm" type="button" data-dialog-open="ws-credentials">
@@ -311,6 +314,16 @@ $has = function ($permission) use ($permissions) {
       <input class="input" name="api_key" autocomplete="off"
              placeholder="Paste the new key — stored encrypted, never displayed">
     </label>
+    <?php if ($p->api_type === 'PRESTMIT'): ?>
+      <p class="text-xs muted">Sell-workflow provider ID: <strong><?=htmlspecialchars((string)$p->id)?></strong>. Supply key, secret and PIN together to rotate credentials.
+        Use only the official sandbox or live partner API URL. Switching environments requires new credentials.</p>
+      <label class="field"><span class="label">New Prestmit API secret</span>
+        <input class="input" type="password" name="prestmit_api_secret" autocomplete="new-password">
+      </label>
+      <label class="field"><span class="label">New Prestmit account PIN</span>
+        <input class="input" type="password" name="prestmit_account_pin" inputmode="numeric" pattern="[0-9]{4,6}" autocomplete="new-password">
+      </label>
+    <?php endif; ?>
     <p class="text-xs muted">
       Saved keys are encrypted at rest, and the connection is tested in the same
       action. On hosts that manage secrets by environment variable, set

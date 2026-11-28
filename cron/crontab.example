@@ -38,6 +38,7 @@ MYPANEL=/var/www/marvysocials
 # --- every 2 minutes ----------------------------------------------------------
 */2  * * * *  cd $MYPANEL && "$PHP" index.php cron vtu_status
 */2  * * * *  cd $MYPANEL && "$PHP" index.php cron giftcard_codes
+*/2  * * * *  cd $MYPANEL && "$PHP" index.php cron giftcard_sales
 */2  * * * *  cd $MYPANEL && "$PHP" index.php cron order_status
 */2  * * * *  cd $MYPANEL && "$PHP" index.php cron inbox_poll      # pull new mail from the SMTP account into the dashboard inboxes
 

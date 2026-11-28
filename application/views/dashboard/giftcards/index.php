@@ -8,6 +8,7 @@ ksort($by_brand);
 <div class="card">
   <div class="row justify-between" style="flex-wrap:wrap;gap:.75rem">
     <h2 class="card-title mb-0">Buy a gift card</h2>
+    <a class="btn btn-secondary btn-sm" href="<?=site_url('dashboard/giftcards/sell')?>">Sell a gift card</a>
     <a class="btn btn-ghost btn-sm" href="<?=site_url('dashboard/giftcards/history')?>">My cards</a>
   </div>
 
@@ -63,7 +64,7 @@ ksort($by_brand);
 
     <p class="hint mb-4">
       You are charged when the order is placed. Codes usually arrive within a
-      minute; if the card is never issued, the charge is refunded automatically.
+      minute. Unfulfilled orders are reconciled with the provider before any refund; an uncertain purchase may require manual review.
     </p>
 
     <?php // Module 36: one code works on every purchase in the panel. ?>

@@ -371,6 +371,11 @@ class CronWorkers {
      * rules — including the one that decides when an undelivered order stops
      * being worth retrying and becomes a refund.
      */
+    public function giftcard_sales($limit = 50) {
+        $this->need(array('Giftcard_sale_model'), array('GiftcardSellService'));
+        return $this->ci->giftcardsellservice->settle_open($limit);
+    }
+
     public function giftcard_codes($limit = 100) {
         $this->need(array('Giftcard_order_model'), array('GiftcardService'));
         return $this->ci->giftcardservice->settle_open_orders($limit);

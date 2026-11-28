@@ -57,7 +57,7 @@ class SecureHttpClient {
             curl_setopt_array($ch, array(
                 CURLOPT_URL => $url,
                 CURLOPT_RETURNTRANSFER => TRUE,
-                CURLOPT_FOLLOWLOCATION => TRUE,
+                CURLOPT_FOLLOWLOCATION => $options['follow_redirects'] ?? TRUE,
                 CURLOPT_MAXREDIRS => 3,
                 CURLOPT_TIMEOUT => $options['timeout'] ?? $this->timeout,
                 CURLOPT_CONNECTTIMEOUT => $options['connect_timeout'] ?? $this->connect_timeout,

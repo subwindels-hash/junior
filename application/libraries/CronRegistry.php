@@ -25,7 +25,7 @@ class CronRegistry {
      */
     const WORKER_JOBS = array(
         'dripfeed', 'order_status', 'vtu_status', 'numbers_status',
-        'identity_purge', 'giftcard_codes', 'service_recovery',
+        'identity_purge', 'giftcard_codes', 'giftcard_sales', 'service_recovery',
         'marketplace_release', 'earnings_release', 'fundsvera_expire',
         'subscriptions', 'provider_health', 'provider_sync', 'refill_status',
         'payment_reconciliation', 'email_queue', 'analytics', 'pin_rotation',
