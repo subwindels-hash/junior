@@ -20,8 +20,10 @@
  * never required.
  *
  * **Real environment wins.** Variables already present in the process
- * environment are never overwritten by `.env`, so a container's injected
- * secrets keep beating a stale file that got copied into an image.
+ * environment are not overwritten by `.env`, so a container's injected
+ * secrets keep beating a stale file that got copied into an image. Empty
+ * encryption/auth/setup variables are the narrow exception: a populated file
+ * value may fill them, matching the empty-is-unset secret lookup contract.
  *
  * **`VP_*` is the portable spelling.** A migration between hosts should only
  * touch the handful of values in the deployment guide, so every setting has a
@@ -32,6 +34,9 @@
  */
 class Env
 {
+    /** Read-only diagnostics can distinguish old and fixed loader behaviour. */
+    const FILLS_EMPTY_BOOTSTRAP_SECRETS = true;
+
     /** Absolute path of the deployment root (the directory holding index.php). */
     private static $root = null;
 
@@ -221,7 +226,16 @@ class Env
      */
     public static function put($name, $value, $overwrite = true)
     {
-        if (!$overwrite && self::raw($name) !== null) {
+        $current = self::raw($name);
+        // Some shared hosts inject empty secret variables into PHP/FastCGI.
+        // They must not hide a populated .env value or block its VP_ alias.
+        // Limit this exception to bootstrap secrets: an intentionally empty
+        // database password or other process setting keeps its old precedence.
+        $fill_empty_secret = $current === '' && (string)$value !== '' && in_array($name, array(
+            'VP_ENCRYPTION_KEY', 'ENCRYPTION_KEY', 'VP_AUTH_SECRET', 'APP_KEY',
+            'VP_SETUP_TOKEN', 'SETUP_TOKEN',
+        ), true);
+        if (!$overwrite && $current !== null && !$fill_empty_secret) {
             return;
         }
         $value = (string)$value;
@@ -253,7 +267,12 @@ class Env
     public static function parse($contents)
     {
         $out = array();
-        $lines = preg_split('/\R/', (string)$contents);
+        // cPanel/desktop editors can save UTF-8 with a BOM. Without removing
+        // it, the first setting fails the name regex (including an encryption
+        // key on line one). Do not otherwise rewrite names or secret bytes.
+        $contents = (string)$contents;
+        if (substr($contents, 0, 3) === "\xef\xbb\xbf") $contents = substr($contents, 3);
+        $lines = preg_split('/\R/', $contents);
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || $line[0] === '#' || strpos($line, '=') === false) {
