@@ -229,7 +229,13 @@ jobs:
 
       # Stage 7 — full PHPUnit suite
       - name: Run test suite
-        run: vendor/bin/phpunit --testdox
+        run: |
+          # The freshness tests inspect this gitignored, reproducible archive.
+          bash tools/build_deployment_package.sh
+          set -o pipefail
+          if vendor/bin/phpunit --testdox 2>&1 | tee /tmp/phpunit.log; then exit 0; fi
+          python3 -c "s=open('/tmp/phpunit.log').read()[-10000:]; [print('::error title=PHPUnit failure::'+s[i:i+2500].replace('%','%25').replace('\r','%0D').replace('\n','%0A')) for i in range(0,len(s),2500)]"
+          exit 1
 
       # Stage 8 — security checks (tree-level invariants)
       - name: Security checks
@@ -339,7 +345,16 @@ jobs:
           docker compose run --rm app php index.php seed core
 
       - name: Boot full stack
-        run: docker compose up -d --wait --wait-timeout 300
+        run: |
+          set -o pipefail
+          if docker compose up -d --wait --wait-timeout 300 2>&1 | tee /tmp/docker-boot.log; then exit 0; fi
+          docker compose ps -a 2>&1 | tee -a /tmp/docker-boot.log
+          python3 -c "s=open('/tmp/docker-boot.log').read()[-2800:]; print('::error title=Docker boot failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          for service in app nginx cron minio; do
+            docker compose logs --tail=25 "$service" > /tmp/service.log 2>&1
+            python3 -c "import sys; s=open('/tmp/service.log').read()[-2500:]; print('::error title=Container '+sys.argv[1]+'::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$service"
+          done
+          exit 1
 
       - name: Prove deploy check exits 0
         run: docker compose exec -T app php index.php deploy check
