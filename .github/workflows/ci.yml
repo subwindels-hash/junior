@@ -241,13 +241,9 @@ jobs:
       - name: Security checks
         run: |
           set -euo pipefail
-          # No license / purchase-code artifacts anywhere in the tree.
-          if grep -RI --exclude-dir=vendor --exclude-dir=node_modules \
-              -E 'purchase_?code|envato' \
-              application tools tests cron index.php 2>/dev/null; then
-            echo "license / purchase-code artifact found (see above)" >&2
-            exit 1
-          fi
+          # Check executable runtime PHP, not policy comments or regression tests
+          # that intentionally name the forbidden artifacts.
+          php tools/audits/check_license_artifacts.php
           # TLS verification must never be disabled in production code paths.
           if grep -RIn --exclude-dir=vendor --exclude-dir=tests -E \
               'SSL_VERIFYPEER\s*=>\s*FALSE|verify_peer\s*=>\s*false|verify_peer\s*=\s*false' \
