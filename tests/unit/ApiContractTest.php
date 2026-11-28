@@ -21,6 +21,19 @@ use PHPUnit\Framework\TestCase;
 class ApiContractTest extends TestCase
 {
     private static $root;
+    private $previousRatelimitPath;
+
+    protected function setUp(): void
+    {
+        $this->previousRatelimitPath = getenv('VP_RATELIMIT_PATH');
+    }
+
+    protected function tearDown(): void
+    {
+        $v = $this->previousRatelimitPath;
+        putenv($v === false ? 'VP_RATELIMIT_PATH' : 'VP_RATELIMIT_PATH='.$v);
+    }
+
 
     public static function setUpBeforeClass(): void
     {

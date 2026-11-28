@@ -154,8 +154,10 @@ services:
 
   # Dev-only S3-compatible storage. Production: a managed bucket (S3/R2).
   minio:
-    # Official alternate registry; the former Docker Hub image is unavailable.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # Build official pinned source: upstream public binary images are unavailable.
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
     container_name: marvy_minio
     command: server /data --console-address ":9001"
     environment:

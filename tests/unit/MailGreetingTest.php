@@ -215,6 +215,18 @@ class MailGreetingTest extends TestCase
         // behaviors such as implicit-ssl tell one pairing from another.
         if (!class_exists('_MailGreetingTestEmail', false)) {
             eval('class _MailGreetingTestEmail extends MY_Email {
+                private static $live = array();
+                public function __construct($config = array()) {
+                    parent::__construct($config);
+                    self::$live[] = $this;
+                }
+                public static function closeTestSockets() {
+                    foreach (self::$live as $mail) {
+                        if (is_resource($mail->_smtp_connect)) fclose($mail->_smtp_connect);
+                        $mail->_smtp_connect = null;
+                    }
+                    self::$live = array();
+                }
                 protected function _open_smtp_socket($ssl) {
                     $marker = ($this->smtp_crypto !== "") ? ";".$this->smtp_crypto : "";
                     return fopen($this->smtp_host.$marker, "r+"); // scriptedsmtp://<behavior>[;<crypto>]
@@ -301,6 +313,9 @@ class MailGreetingTest extends TestCase
 
     protected function tearDown(): void
     {
+        // Close scripted sockets while the test CI still exists, not from a
+        // CI_Email destructor after PHPUnit has restored all fake globals.
+        _MailGreetingTestEmail::closeTestSockets();
         foreach ($this->restoreGlobals as $key => $value) {
             if (in_array($key, $this->freshGlobals, true)) {
                 unset($GLOBALS[$key]);
