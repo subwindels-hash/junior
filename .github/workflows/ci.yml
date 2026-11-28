@@ -94,7 +94,7 @@ jobs:
       # front controller expects it at the repo root (it is gitignored, so CI
       # must materialise it rather than rely on a committed copy).
       - name: Link CodeIgniter system directory
-        run: ln -sf vendor/codeigniter/framework/system system
+        run: php tools/link_system.php
 
       # Stage 2 — code quality
       - name: PHP syntax lint
@@ -224,7 +224,7 @@ jobs:
         run: |
           set -o pipefail
           if bash tools/verify_deployment_package.sh 2>&1 | tee /tmp/package-check.log; then exit 0; fi
-          python3 -c "s=open('/tmp/package-check.log').read()[-14000:]; print('::error title=Deployment package failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          python3 -c "s=open('/tmp/package-check.log').read()[-2800:]; print('::error title=Deployment package failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
           exit 1
 
       # Stage 7 — full PHPUnit suite
@@ -322,7 +322,7 @@ jobs:
         run: |
           set -o pipefail
           if docker compose --progress plain build 2>&1 | tee /tmp/docker-build.log; then exit 0; fi
-          python3 -c "s=open('/tmp/docker-build.log').read()[-14000:]; print('::error title=Docker build failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          python3 -c "s=open('/tmp/docker-build.log').read()[-2800:]; print('::error title=Docker build failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
           exit 1
 
       - name: Boot datastores
