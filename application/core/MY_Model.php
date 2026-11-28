@@ -10,9 +10,8 @@ class MY_Model extends CI_Model {
     public function find_by($where){ return $this->db->where($where)->get($this->table)->result(); }
 
     protected function new_public_id(){
-        // ULID if available, else UUID v4
-        if (class_exists(\Robbins\Ulid\Ulid::class)) return (string)\Robbins\Ulid\Ulid::generate();
-        if (class_exists(\Ramsey\Uuid\Uuid::class)) return \Ramsey\Uuid\Uuid::uuid4()->toString();
+        // Public IDs must fit CHAR(26), with or without Composer installed.
+        if (class_exists(\Ulid\Ulid::class)) return (string)\Ulid\Ulid::generate();
         return bin2hex(random_bytes(13));
     }
 

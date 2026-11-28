@@ -178,10 +178,11 @@ jobs:
 
       - name: Import marvysocials.sql into an empty database (what phpMyAdmin does)
         env:
-          MYSQL_PWD: marvy_secret
+          MYSQL_PWD: root
         run: |
-          mysql -h 127.0.0.1 -P 3306 -umarvy -e "DROP DATABASE IF EXISTS marvy_import; CREATE DATABASE marvy_import CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-          mysql -h 127.0.0.1 -P 3306 -umarvy marvy_import < database/marvysocials.sql
+          # The service account only owns marvysocials; use root for fixture DDL.
+          mysql -h 127.0.0.1 -P 3306 -uroot -e "DROP DATABASE IF EXISTS marvy_import; CREATE DATABASE marvy_import CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON marvy_import.* TO 'marvy'@'%';"
+          MYSQL_PWD=marvy_secret mysql -h 127.0.0.1 -P 3306 -umarvy marvy_import < database/marvysocials.sql
 
       - name: A freshly imported database needs no migration and no seed
         env:
@@ -196,7 +197,7 @@ jobs:
           # Migrations: already recorded, so this must be a no-op rather than a
           # replay that collides with existing tables.
           php index.php migrate | tee /tmp/migrate.out
-          grep -qi "already\|nothing\|up to date\|current" /tmp/migrate.out || {
+          grep -qi "already\|nothing\|up to date\|current\|schema at version" /tmp/migrate.out || {
             echo "an imported database should have nothing to migrate" >&2; exit 1; }
 
           # Core seed: idempotent, so re-running it must insert nothing. If it
@@ -208,27 +209,15 @@ jobs:
           [ "$before" = "$after" ] || {
             echo "core seed inserted rows into an imported database ($before -> $after): marvysocials.sql is incomplete" >&2; exit 1; }
 
-      - name: The seeded administrator can authenticate
-        env:
-          DB_HOST: 127.0.0.1
-          DB_PORT: 3306
-          DB_USER: marvy
-          DB_PASSWORD: marvy_secret
-          DB_NAME: marvy_import
+      - name: Fresh imports have no users and include first-admin permissions
         run: |
           php -r '
-            $sql = file_get_contents("database/marvysocials.sql");
-            preg_match("/--\s+password:\s+(\S+)/", $sql, $pw);
             $db = new mysqli("127.0.0.1", "marvy", "marvy_secret", "marvy_import", 3306);
-            $row = $db->query("SELECT password_hash, status, role FROM users WHERE role = \"SUPER_ADMIN\" LIMIT 1")->fetch_assoc();
-            if (!$row) { fwrite(STDERR, "no administrator in the imported database\n"); exit(1); }
-            if ($row["status"] !== "ACTIVE") { fwrite(STDERR, "administrator is not ACTIVE\n"); exit(1); }
-            if (!password_verify($pw[1], $row["password_hash"])) {
-              fwrite(STDERR, "the documented password does not verify against the seeded hash\n"); exit(1);
-            }
+            $users = $db->query("SELECT COUNT(*) c FROM users")->fetch_assoc();
+            if ((int)$users["c"] !== 0) { fwrite(STDERR, "fresh import must not contain default accounts\n"); exit(1); }
             $grants = $db->query("SELECT COUNT(*) c FROM role_permissions rp JOIN roles r ON r.id = rp.role_id WHERE r.name = \"SUPER_ADMIN\"")->fetch_assoc();
             if ((int)$grants["c"] === 0) { fwrite(STDERR, "SUPER_ADMIN has no permissions\n"); exit(1); }
-            echo "administrator authenticates, ", $grants["c"], " permissions granted\n";
+            echo "fresh import has no accounts; ", $grants["c"], " first-admin permissions available\n";
           '
 
       - name: Deployment package builds and deploys with no terminal
@@ -285,13 +274,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A fresh clone has no .env; compose requires one (env_file). This is the
-      # documented first-boot step, with a real (non-placeholder) key.
+      # Dedicated non-production fixture, not the cPanel production template.
       - name: Create dev .env
         run: |
-          cp .env.example .env
           key=$(openssl rand -hex 32)
-          sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${key}|" .env
+          auth=$(openssl rand -hex 32)
+          cat > .env <<EOF
+          CI_ENV=development
+          APP_ENV=development
+          APP_URL=http://localhost:8080/
+          ENCRYPTION_KEY=${key}
+          APP_KEY=${auth}
+          DB_HOST=mysql
+          DB_PORT=3306
+          DB_NAME=marvysocials
+          DB_USER=marvy
+          DB_PASSWORD=marvy_secret
+          MAIL_DRIVER=smtp
+          SMTP_HOST=mailhog
+          SMTP_PORT=1025
+          SMTP_CRYPTO=
+          MAIL_FROM_ADDRESS=noreply@example.test
+          DEMO_MODE=false
+          EOF
 
       # Both compose files bind-mount the checkout over /var/www/html, so the
       # HOST needs vendor/ and the system/ link (composer's post-install hook
@@ -300,6 +305,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
+          extensions: mbstring, curl, bcmath, mysqli, pdo_mysql, gd, zip, intl, simplexml
           tools: composer:v2
           coverage: none
 

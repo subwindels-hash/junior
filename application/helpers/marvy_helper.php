@@ -34,8 +34,7 @@ if (!function_exists('csrf')) {
 }
 
 if (!function_exists('marvy_public_id')) {    function marvy_public_id(){
-        if (class_exists(\Robbins\Ulid\Ulid::class)) return (string)\Robbins\Ulid\Ulid::generate();
-        if (class_exists(\Ramsey\Uuid\Uuid::class)) return \Ramsey\Uuid\Uuid::uuid4()->toString();
+        if (class_exists(\Ulid\Ulid::class)) return (string)\Ulid\Ulid::generate();
         return bin2hex(random_bytes(13));
     }
 }
