@@ -31,9 +31,14 @@ WORKDIR /var/www/html
 # the system/ link is created explicitly below. A failed install must fail the
 # build — never ship an image with half a vendor tree.
 COPY composer.json composer.lock* ./
-RUN composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts
+RUN composer install --no-dev --no-interaction --prefer-dist --no-progress --no-scripts --no-autoloader
 
 COPY . .
+
+# Project classmaps/helpers do not exist in the cached dependency layer above.
+# Generate the autoloader only after application/ is present; --no-scripts
+# keeps the link hook separate and explicit below.
+RUN composer dump-autoload --no-dev --optimize --no-scripts
 
 # CodeIgniter 3.1.13 ships system/ inside the composer package; the front
 # controller expects it at the app root (it is gitignored, so neither the

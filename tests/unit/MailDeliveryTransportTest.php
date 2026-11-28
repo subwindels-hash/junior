@@ -203,6 +203,9 @@ class MailDeliveryTransportTest extends TestCase
         // CI3: ERROR=1, DEBUG=2, INFO=3; threshold is 1 (prod) or 2 (debug).
         // Anything logged at 'info' is dropped, so the payload must not rely
         // on that level to survive.
+        // Other tests may already own the process-wide log_message() shim.
+        // Keep a non-vacuous assertion even when that shim cannot capture calls.
+        $this->assertStringContainsString('TOKEN123', $this->mailLogContents());
         foreach ($GLOBALS['__mail_log_calls'] as $call) {
             $this->assertNotSame('info', strtolower((string)$call[0]),
                 'mail payloads must not be written at a level CI3 throws away');

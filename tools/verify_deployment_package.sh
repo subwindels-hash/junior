@@ -139,6 +139,11 @@ define('ENVIRONMENT', 'production');
 define('APPPATH', $site . '/application/');
 define('BASEPATH', $site . '/system/');
 define('FCPATH', $site . '/');
+// Model a real TLS request; a CLI process has no HTTPS transport by default.
+$_SERVER['HTTPS'] = 'on';
+$_SERVER['HTTP_HOST'] = 'newdomain.example';
+$_SERVER['REQUEST_SCHEME'] = 'https';
+$_SERVER['SERVER_PORT'] = '443';
 
 require_once APPPATH . 'core/Env.php';
 Env::bootstrap($site);
@@ -157,6 +162,17 @@ require APPPATH . 'config/config.php';
 want('base_url comes from VP_BASE_URL', $config['base_url'] === 'https://newdomain.example/', $config['base_url']);
 want('session driver is files (no Redis on shared hosting)', $config['sess_driver'] === 'files', $config['sess_driver']);
 want('secure cookies on an https deployment', $config['cookie_secure'] === true);
+// The same HTTPS base URL must not force Secure cookies on a plain HTTP request.
+$_SERVER['HTTPS'] = 'off';
+unset($_SERVER['HTTP_X_FORWARDED_PROTO'], $_SERVER['HTTP_X_FORWARDED_SSL'], $_SERVER['HTTP_CF_VISITOR']);
+$_SERVER['SERVER_PORT'] = '80';
+$_SERVER['REQUEST_SCHEME'] = 'http';
+$config = array();
+require APPPATH . 'config/config.php';
+want('plain HTTP does not set Secure cookies', $config['cookie_secure'] === false);
+$_SERVER['HTTPS'] = 'on';
+$config = array();
+require APPPATH . 'config/config.php';
 want('log path is inside the writable storage dir',
      strpos($config['log_path'], $site . '/storage/logs') === 0, $config['log_path']);
 want('session files land in the writable session dir',

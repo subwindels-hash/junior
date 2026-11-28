@@ -94,7 +94,7 @@ jobs:
       # front controller expects it at the repo root (it is gitignored, so CI
       # must materialise it rather than rely on a committed copy).
       - name: Link CodeIgniter system directory
-        run: ln -sf vendor/codeigniter/framework/system system
+        run: php tools/link_system.php
 
       # Stage 2 — code quality
       - name: PHP syntax lint
@@ -178,10 +178,11 @@ jobs:
 
       - name: Import marvysocials.sql into an empty database (what phpMyAdmin does)
         env:
-          MYSQL_PWD: marvy_secret
+          MYSQL_PWD: root
         run: |
-          mysql -h 127.0.0.1 -P 3306 -umarvy -e "DROP DATABASE IF EXISTS marvy_import; CREATE DATABASE marvy_import CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-          mysql -h 127.0.0.1 -P 3306 -umarvy marvy_import < database/marvysocials.sql
+          # The service account only owns marvysocials; use root for fixture DDL.
+          mysql -h 127.0.0.1 -P 3306 -uroot -e "DROP DATABASE IF EXISTS marvy_import; CREATE DATABASE marvy_import CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON marvy_import.* TO 'marvy'@'%';"
+          MYSQL_PWD=marvy_secret mysql -h 127.0.0.1 -P 3306 -umarvy marvy_import < database/marvysocials.sql
 
       - name: A freshly imported database needs no migration and no seed
         env:
@@ -196,7 +197,7 @@ jobs:
           # Migrations: already recorded, so this must be a no-op rather than a
           # replay that collides with existing tables.
           php index.php migrate | tee /tmp/migrate.out
-          grep -qi "already\|nothing\|up to date\|current" /tmp/migrate.out || {
+          grep -qi "already\|nothing\|up to date\|current\|schema at version" /tmp/migrate.out || {
             echo "an imported database should have nothing to migrate" >&2; exit 1; }
 
           # Core seed: idempotent, so re-running it must insert nothing. If it
@@ -208,47 +209,41 @@ jobs:
           [ "$before" = "$after" ] || {
             echo "core seed inserted rows into an imported database ($before -> $after): marvysocials.sql is incomplete" >&2; exit 1; }
 
-      - name: The seeded administrator can authenticate
-        env:
-          DB_HOST: 127.0.0.1
-          DB_PORT: 3306
-          DB_USER: marvy
-          DB_PASSWORD: marvy_secret
-          DB_NAME: marvy_import
+      - name: Fresh imports have no users and include first-admin permissions
         run: |
           php -r '
-            $sql = file_get_contents("database/marvysocials.sql");
-            preg_match("/--\s+password:\s+(\S+)/", $sql, $pw);
             $db = new mysqli("127.0.0.1", "marvy", "marvy_secret", "marvy_import", 3306);
-            $row = $db->query("SELECT password_hash, status, role FROM users WHERE role = \"SUPER_ADMIN\" LIMIT 1")->fetch_assoc();
-            if (!$row) { fwrite(STDERR, "no administrator in the imported database\n"); exit(1); }
-            if ($row["status"] !== "ACTIVE") { fwrite(STDERR, "administrator is not ACTIVE\n"); exit(1); }
-            if (!password_verify($pw[1], $row["password_hash"])) {
-              fwrite(STDERR, "the documented password does not verify against the seeded hash\n"); exit(1);
-            }
+            $users = $db->query("SELECT COUNT(*) c FROM users")->fetch_assoc();
+            if ((int)$users["c"] !== 0) { fwrite(STDERR, "fresh import must not contain default accounts\n"); exit(1); }
             $grants = $db->query("SELECT COUNT(*) c FROM role_permissions rp JOIN roles r ON r.id = rp.role_id WHERE r.name = \"SUPER_ADMIN\"")->fetch_assoc();
             if ((int)$grants["c"] === 0) { fwrite(STDERR, "SUPER_ADMIN has no permissions\n"); exit(1); }
-            echo "administrator authenticates, ", $grants["c"], " permissions granted\n";
+            echo "fresh import has no accounts; ", $grants["c"], " first-admin permissions available\n";
           '
 
       - name: Deployment package builds and deploys with no terminal
-        run: bash tools/verify_deployment_package.sh
+        run: |
+          set -o pipefail
+          if bash tools/verify_deployment_package.sh 2>&1 | tee /tmp/package-check.log; then exit 0; fi
+          python3 -c "s=open('/tmp/package-check.log').read()[-2800:]; print('::error title=Deployment package failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          exit 1
 
       # Stage 7 — full PHPUnit suite
       - name: Run test suite
-        run: vendor/bin/phpunit --testdox
+        run: |
+          # The freshness tests inspect this gitignored, reproducible archive.
+          bash tools/build_deployment_package.sh
+          set -o pipefail
+          if vendor/bin/phpunit --testdox 2>&1 | tee /tmp/phpunit.log; then exit 0; fi
+          python3 -c "s=open('/tmp/phpunit.log').read()[-10000:]; [print('::error title=PHPUnit failure::'+s[i:i+2500].replace('%','%25').replace('\r','%0D').replace('\n','%0A')) for i in range(0,len(s),2500)]"
+          exit 1
 
       # Stage 8 — security checks (tree-level invariants)
       - name: Security checks
         run: |
           set -euo pipefail
-          # No license / purchase-code artifacts anywhere in the tree.
-          if grep -RI --exclude-dir=vendor --exclude-dir=node_modules \
-              -E 'purchase_?code|envato' \
-              application tools tests cron index.php 2>/dev/null; then
-            echo "license / purchase-code artifact found (see above)" >&2
-            exit 1
-          fi
+          # Check executable runtime PHP, not policy comments or regression tests
+          # that intentionally name the forbidden artifacts.
+          php tools/audits/check_license_artifacts.php
           # TLS verification must never be disabled in production code paths.
           if grep -RIn --exclude-dir=vendor --exclude-dir=tests -E \
               'SSL_VERIFYPEER\s*=>\s*FALSE|verify_peer\s*=>\s*false|verify_peer\s*=\s*false' \
@@ -285,13 +280,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A fresh clone has no .env; compose requires one (env_file). This is the
-      # documented first-boot step, with a real (non-placeholder) key.
+      # Dedicated non-production fixture, not the cPanel production template.
       - name: Create dev .env
         run: |
-          cp .env.example .env
           key=$(openssl rand -hex 32)
-          sed -i "s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${key}|" .env
+          auth=$(openssl rand -hex 32)
+          cat > .env <<EOF
+          CI_ENV=development
+          APP_ENV=development
+          APP_URL=http://localhost:8080/
+          ENCRYPTION_KEY=${key}
+          APP_KEY=${auth}
+          DB_HOST=mysql
+          DB_PORT=3306
+          DB_NAME=marvysocials
+          DB_USER=marvy
+          DB_PASSWORD=marvy_secret
+          MAIL_DRIVER=smtp
+          SMTP_HOST=mailhog
+          SMTP_PORT=1025
+          SMTP_CRYPTO=
+          MAIL_FROM_ADDRESS=noreply@example.test
+          DEMO_MODE=false
+          EOF
 
       # Both compose files bind-mount the checkout over /var/www/html, so the
       # HOST needs vendor/ and the system/ link (composer's post-install hook
@@ -300,6 +311,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
+          extensions: mbstring, curl, bcmath, mysqli, pdo_mysql, gd, zip, intl, simplexml
           tools: composer:v2
           coverage: none
 
@@ -309,7 +321,11 @@ jobs:
           test -e system/core/CodeIgniter.php
 
       - name: Build development images
-        run: docker compose build
+        run: |
+          set -o pipefail
+          if docker compose --progress plain build 2>&1 | tee /tmp/docker-build.log; then exit 0; fi
+          python3 -c "s=open('/tmp/docker-build.log').read()[-2800:]; print('::error title=Docker build failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          exit 1
 
       - name: Boot datastores
         run: docker compose up -d --wait mysql redis
@@ -325,7 +341,16 @@ jobs:
           docker compose run --rm app php index.php seed core
 
       - name: Boot full stack
-        run: docker compose up -d --wait --wait-timeout 300
+        run: |
+          set -o pipefail
+          if docker compose up -d --wait --wait-timeout 300 2>&1 | tee /tmp/docker-boot.log; then exit 0; fi
+          docker compose ps -a 2>&1 | tee -a /tmp/docker-boot.log
+          python3 -c "s=open('/tmp/docker-boot.log').read()[-2800:]; print('::error title=Docker boot failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          for service in app nginx cron minio; do
+            docker compose logs --tail=25 "$service" > /tmp/service.log 2>&1
+            python3 -c "import sys; s=open('/tmp/service.log').read()[-2500:]; print('::error title=Container '+sys.argv[1]+'::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$service"
+          done
+          exit 1
 
       - name: Prove deploy check exits 0
         run: docker compose exec -T app php index.php deploy check
