@@ -221,7 +221,11 @@ jobs:
           '
 
       - name: Deployment package builds and deploys with no terminal
-        run: bash tools/verify_deployment_package.sh
+        run: |
+          set -o pipefail
+          if bash tools/verify_deployment_package.sh 2>&1 | tee /tmp/package-check.log; then exit 0; fi
+          python3 -c "s=open('/tmp/package-check.log').read()[-14000:]; print('::error title=Deployment package failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          exit 1
 
       # Stage 7 — full PHPUnit suite
       - name: Run test suite
@@ -315,7 +319,11 @@ jobs:
           test -e system/core/CodeIgniter.php
 
       - name: Build development images
-        run: docker compose build
+        run: |
+          set -o pipefail
+          if docker compose --progress plain build 2>&1 | tee /tmp/docker-build.log; then exit 0; fi
+          python3 -c "s=open('/tmp/docker-build.log').read()[-14000:]; print('::error title=Docker build failure::'+s.replace('%','%25').replace('\r','%0D').replace('\n','%0A'))"
+          exit 1
 
       - name: Boot datastores
         run: docker compose up -d --wait mysql redis
