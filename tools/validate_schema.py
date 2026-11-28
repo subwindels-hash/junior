@@ -36,6 +36,8 @@ MONEY_EXEMPT = {
     ("referral_accounts", "commission_percent"),
     ("api_keys", "rate_limit_per_minute"),
     ("providers", "rate_multiplier"),
+    ("currencies", "rate_source"),  # provenance label, not an exchange rate
+    ("marketplace_orders", "refunded_quantity"),  # unit count, not a refund amount
 }
 BANNED = ("purchase_code", "license_server", "envato", "domain_lock")
 
@@ -110,10 +112,10 @@ def main() -> int:
             target = stmt.this.name if stmt.this else "?"
             if target not in tables:
                 err(f"ALTER on unknown table {target}")
-            for action in stmt.args.get("actions", []):
-                for fk in action.find_all(exp.ForeignKey):
-                    fk_count += 1
-                    check_fk(target, fk, tables)
+            # sqlglot represents ADD COLUMN as ColumnDef actions. Previously
+            # those were ignored, so valid later FKs were reported as missing
+            # columns and new-column house rules were never checked at all.
+            fk_count += apply_alter(target, stmt.args.get("actions", []), tables)
 
     # FKs declared inline inside CREATE TABLE need the raw text (sqlglot keeps them
     # as ForeignKey nodes with a Reference); re-walk with table context.
@@ -148,6 +150,20 @@ def main() -> int:
         return 1
     print(f"OK — schema valid ({len(warnings)} warning(s))")
     return 0
+
+
+def apply_alter(target: str, actions: list, tables: dict[str, set[str]]) -> int:
+    fk_count = 0
+    for action in actions:
+        if isinstance(action, exp.ColumnDef):
+            if target in tables:
+                tables[target].add(action.name)
+            dtype = action.args.get("kind")
+            check_column(target, action.name, dtype.sql(dialect="mysql").upper() if dtype else "", action)
+        for fk in action.find_all(exp.ForeignKey):
+            fk_count += 1
+            check_fk(target, fk, tables)
+    return fk_count
 
 
 def check_column(table: str, col: str, dtype: str, cdef) -> None:

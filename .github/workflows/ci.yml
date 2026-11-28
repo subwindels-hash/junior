@@ -116,6 +116,7 @@ jobs:
           # sqlglot is not preinstalled on GitHub runners; without it the
           # linter exits 1 and this step would fail before parsing anything.
           python3 -m pip install --quiet sqlglot
+          python3 -m unittest discover -s tests/python -v
           python3 tools/validate_schema.py docs/database.sql
 
       # Stage 4 — schema validation (database.sql must match migrations)

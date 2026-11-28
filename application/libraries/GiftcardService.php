@@ -126,7 +126,8 @@ class GiftcardService {
             'coupon_code'     => $input['coupon_code'] ?? null,
             // Metadata is readable by anyone who can see the transaction, so
             // it carries what was bought and never a card number.
-            'metadata'        => array('product' => $product->code, 'quantity' => $quantity),
+            'metadata'        => array('product' => $product->code, 'quantity' => $quantity,
+                'provider_api_type' => $provider->api_type, 'provider_url' => rtrim($provider->api_url, '/')),
 
             'detail' => function ($id) use ($product, $quantity, $email, $order_model, &$tx_id) {
                 $tx_id = $id;
@@ -150,6 +151,13 @@ class GiftcardService {
                                               $order_model, $provider_log, $sender) {
                 $started = microtime(true);
                 $adapter = $manager->adapter($provider, Provider_manager::FAMILY_GIFTCARD);
+                if ($provider->api_type === 'PRESTMIT') {
+                    // Durable recovery key BEFORE the POST. A process/logging
+                    // failure after acceptance must still be collectible.
+                    if (!$order_model->update_for_transaction($tx->id, array('status' => 'PLACED',
+                        'provider_order_id' => 'prestmit-pending:'.$tx->public_id,
+                        'placed_at' => gmdate('Y-m-d H:i:s')))) throw new RuntimeException('Could not persist dispatch key');
+                }
                 $res = $adapter->order(array(
                     'product_id'      => $product->provider_product_id,
                     'quantity'        => $quantity,
@@ -160,6 +168,7 @@ class GiftcardService {
                     // The vendor's idempotency key, so a timeout on the way
                     // out cannot become two purchases.
                     'reference'       => $tx->public_id,
+                    'max_cost'        => $tx->amount,
                 ));
                 $latency = (int)round((microtime(true) - $started) * 1000);
 
@@ -177,6 +186,7 @@ class GiftcardService {
                 if (empty($res['ok'])) {
                     $order_model->update_for_transaction($tx->id, array(
                         'status'         => 'FAILED',
+                        'provider_order_id' => null,
                         'failure_reason' => isset($res['error'])
                             ? mb_substr((string)$res['error'], 0, 255) : null,
                     ));
@@ -208,6 +218,11 @@ class GiftcardService {
         if (empty($result['ok'])) {
             if (!empty($result['transaction'])) {
                 $result['order'] = $order_model->for_transaction($result['transaction']->id);
+                if ($provider->api_type === 'PRESTMIT' && $result['transaction']->status === 'PROCESSING') {
+                    $result['uncertain'] = true;
+                    $result['code'] = 'RECONCILIATION_REQUIRED';
+                    $result['error'] = 'This purchase is recorded and still awaiting reconciliation. Do not submit a new purchase. Check this receipt or contact support with its reference.';
+                }
             }
             return $result;
         }
@@ -246,6 +261,10 @@ class GiftcardService {
 
         $tx = $this->ci->Service_transaction_model->find_by_id($order->service_transaction_id);
         if (!$tx) return $this->err('Transaction not found', 'NOT_FOUND');
+        if (in_array($tx->status, array('FAILED', 'CANCELLED', 'REFUNDED'), true)
+            || bccomp((string)($tx->refunded_amount ?? '0'), '0', 8) > 0) {
+            return $this->err('This purchase is closed or refunded. Codes cannot be delivered.', 'TERMINAL');
+        }
         if ($order->status === 'DELIVERED') {
             return array('ok' => true, 'ready' => true, 'order' => $order,
                          'cards' => $this->ci->Giftcard_code_model->for_order($order->id));
@@ -259,6 +278,12 @@ class GiftcardService {
 
         $provider = $tx->provider_id ? $this->ci->Provider_model->find_by_id($tx->provider_id) : null;
         if (!$provider) return $this->err('The vendor for this order is no longer configured', 'NO_PROVIDER');
+        $meta = json_decode((string)($tx->metadata ?? ''), true) ?: array();
+        if (($meta['provider_api_type'] ?? '') === 'PRESTMIT'
+            && ($provider->api_type !== 'PRESTMIT' || ($meta['provider_url'] ?? '') !== rtrim($provider->api_url, '/'))) {
+            return $this->err('Provider identity changed; restore its original environment before reconciliation.', 'PROVIDER_CHANGED');
+        }
+
 
         // Counted before the call, not after: a call that throws still used an
         // attempt, and a vendor that reliably times out must still reach the
@@ -298,29 +323,43 @@ class GiftcardService {
                          'cards' => array());
         }
 
-        $stored = $this->store_cards($order, $res['cards']);
-        if ($stored === 0) {
-            return array('ok' => true, 'ready' => false,
-                         'order' => $this->ci->Giftcard_order_model->find_by_id($order->id),
-                         'cards' => $this->ci->Giftcard_code_model->for_order($order->id));
+        if ($provider->api_type === 'PRESTMIT' && count($res['cards']) !== (int)$order->quantity) {
+            return $this->err('Prestmit has not returned the full quantity of gift card codes.', 'PARTIAL_DELIVERY');
         }
-
-        $this->ci->Giftcard_order_model->update_fields($order->id, array(
-            'status'       => 'DELIVERED',
-            'delivered_at' => gmdate('Y-m-d H:i:s'),
-        ));
-
-        // The customer can now spend something, so the money is earned.
-        if ($tx->status === 'PROCESSING') {
-            $this->ci->transactionengine->transition($tx->id, 'SUCCESSFUL', 'PROVIDER');
+        // The same row lock used by TransactionEngine serializes delivery with
+        // every refund. Recheck AFTER the network call; never trust stale state.
+        $this->ci->db->trans_begin();
+        try {
+            $locked = $this->ci->Service_transaction_model->find_for_update($tx->id);
+            $fresh = $this->ci->Giftcard_order_model->for_transaction($tx->id);
+            if (!$locked || !$fresh || !in_array($locked->status, array('PROCESSING', 'SUCCESSFUL'), true)
+                || bccomp((string)($locked->refunded_amount ?? '0'), '0', 8) > 0) {
+                $this->ci->db->trans_rollback();
+                return $this->err('Purchase closed during collection; no codes delivered.', 'TERMINAL');
+            }
+            if ($fresh->status !== 'DELIVERED') {
+                if (!in_array($fresh->status, Giftcard_order_model::$open_states, true)) throw new RuntimeException('Closed order');
+                $this->store_cards($fresh, $res['cards']);
+                if ($this->ci->Giftcard_code_model->count_for_order($fresh->id) < (int)$fresh->quantity) {
+                    $this->ci->db->trans_rollback();
+                    return $this->err('The full card quantity has not arrived.', 'PARTIAL_DELIVERY');
+                }
+                if (!$this->ci->Giftcard_order_model->update_fields($fresh->id, array(
+                    'status' => 'DELIVERED', 'delivered_at' => gmdate('Y-m-d H:i:s')))) throw new RuntimeException('Could not save delivery.');
+                if ($locked->status === 'PROCESSING') {
+                    $settled = $this->ci->transactionengine->transition($locked->id, 'SUCCESSFUL', 'PROVIDER');
+                    if (empty($settled['ok'])) throw new RuntimeException('Settlement failed');
+                }
+            }
+            if (!$this->ci->db->trans_status()) throw new RuntimeException('Delivery storage failed');
+            $this->ci->db->trans_commit();
+            return array('ok' => true, 'ready' => true,
+                'order' => $this->ci->Giftcard_order_model->find_by_id($fresh->id),
+                'cards' => $this->ci->Giftcard_code_model->for_order($fresh->id));
+        } catch (Throwable $e) {
+            $this->ci->db->trans_rollback();
+            return $this->err('Could not settle card delivery. Retry reconciliation.', 'DELIVERY_FAILED');
         }
-
-        return array(
-            'ok'    => true,
-            'ready' => true,
-            'order' => $this->ci->Giftcard_order_model->find_by_id($order->id),
-            'cards' => $this->ci->Giftcard_code_model->for_order($order->id),
-        );
     }
 
     /**
@@ -336,33 +375,30 @@ class GiftcardService {
      */
     public function abandon($order, $source = 'CRON', $reason = null) {
         if (!$order) return $this->err('Order not found', 'NOT_FOUND');
-
-        $tx = $this->ci->Service_transaction_model->find_by_id($order->service_transaction_id);
-        if (!$tx) return $this->err('Transaction not found', 'NOT_FOUND');
-        if ($this->ci->Giftcard_code_model->count_for_order($order->id) > 0) {
-            return $this->err('This order has delivered codes and cannot be written off', 'HAS_CODES');
+        $this->ci->db->trans_begin();
+        try {
+            $tx = $this->ci->Service_transaction_model->find_for_update($order->service_transaction_id);
+            $order = $this->ci->Giftcard_order_model->for_transaction($order->service_transaction_id);
+            if (!$tx || !$order) throw new RuntimeException('Missing purchase');
+            if ($this->ci->Giftcard_code_model->count_for_order($order->id) > 0) {
+                $this->ci->db->trans_rollback();
+                return $this->err('This order has delivered codes and cannot be written off', 'HAS_CODES');
+            }
+            if (!in_array($order->status, Giftcard_order_model::$open_states, true)) {
+                $this->ci->db->trans_rollback();
+                return $this->err('This order is already closed', 'NOT_OPEN');
+            }
+            $res = $this->ci->transactionengine->transition($tx->id, 'FAILED', $source,
+                $reason ?: 'The vendor never delivered this gift card');
+            if (empty($res['ok'])) { $this->ci->db->trans_rollback(); return $res; }
+            if (!$this->ci->db->trans_status()) throw new RuntimeException('Refund failed');
+            $this->ci->db->trans_commit();
+            return array('ok' => true, 'refunded' => $res['refunded'] ?? null,
+                'order' => $this->ci->Giftcard_order_model->find_by_id($order->id));
+        } catch (Throwable $e) {
+            $this->ci->db->trans_rollback();
+            return $this->err('Could not reconcile the gift-card refund.', 'REFUND_FAILED');
         }
-        if (!in_array($order->status, Giftcard_order_model::$open_states, true)) {
-            return $this->err('This order is already '.strtolower($order->status), 'NOT_OPEN');
-        }
-
-        $reason = $reason ?: 'The vendor accepted the order but never issued a code';
-        $this->ci->Giftcard_order_model->update_fields($order->id, array(
-            'status'         => 'FAILED',
-            'failure_reason' => mb_substr($reason, 0, 255),
-        ));
-
-        $refunded = null;
-        if (!in_array($tx->status, array('FAILED','CANCELLED','REFUNDED'), true)) {
-            $res = $this->ci->transactionengine->transition($tx->id, 'FAILED', $source, $reason);
-            if (!empty($res['ok'])) $refunded = $res['refunded'];
-        }
-
-        return array(
-            'ok'       => true,
-            'refunded' => $refunded,
-            'order'    => $this->ci->Giftcard_order_model->find_by_id($order->id),
-        );
     }
 
     /**

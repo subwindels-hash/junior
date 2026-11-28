@@ -50,6 +50,7 @@ class Provider_manager {
         self::FAMILY_GIFTCARD => array(
             'MOCK_GIFTCARD' => array('MockGiftcardAdapter', 'MockGiftcardAdapter.php'),
             'RELOADLY'      => array('ReloadlyAdapter', 'ReloadlyAdapter.php'),
+            'PRESTMIT'      => array('PrestmitAdapter', 'PrestmitAdapter.php'),
         ),
     );
 

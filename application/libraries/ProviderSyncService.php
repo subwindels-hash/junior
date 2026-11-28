@@ -989,10 +989,21 @@ class ProviderSyncService {
      * @return array{ok:bool, error?:string, counts?:array}
      */
     public function delete_provider($provider) {
+        if ($provider && strtoupper($provider->api_type) === 'PRESTMIT'
+            && $this->ci->db->where('provider_id', $provider->id)->where('service_domain', 'GIFTCARD')
+                ->count_all_results('service_transactions') > 0) {
+            return array('ok' => false, 'error' => 'This Prestmit provider has gift-card purchase history. Disable it instead.');
+        }
+
         if (!$provider || empty($provider->id)) {
             return array('ok' => false, 'error' => 'Unknown provider.');
         }
         $id = (int)$provider->id;
+        // Retain the provider identity behind incoming bearer instruments and credits.
+        if ($this->ci->db->table_exists('giftcard_sales')
+            && $this->ci->db->where('provider_id', $id)->count_all_results('giftcard_sales') > 0) {
+            return array('ok' => false, 'error' => 'This provider has gift-card sale history and cannot be deleted. Disable it instead.');
+        }
 
         $counts = array(
             'synced_services' => (int)$this->ci->db->where('provider_id', $id)->count_all_results('provider_services'),
@@ -1066,6 +1077,13 @@ class ProviderSyncService {
         // they travel in one blob for the same reason Dojah's do. The create
         // form reuses the api_key field for the client id, which keeps one
         // form working for every vendor — see validate().
+        if ($type === 'PRESTMIT') {
+            return json_encode(array(
+                'api_key' => trim((string)$input['api_key']),
+                'api_secret' => trim((string)($input['prestmit_api_secret'] ?? '')),
+                'account_pin' => trim((string)($input['prestmit_account_pin'] ?? '')),
+            ));
+        }
         if ($type === 'RELOADLY') {
             return json_encode(array(
                 'client_id'     => trim((string)$input['api_key']),
@@ -1124,6 +1142,26 @@ class ProviderSyncService {
         }
         if (isset($input['api_type']) && strtoupper($input['api_type']) === 'RELOADLY') {
             foreach ($this->reloadly_credential_errors($input) as $e) $errors[] = $e;
+        }
+        if (isset($input['api_type']) && strtoupper($input['api_type']) === 'PRESTMIT') {
+            require_once __DIR__.'/PrestmitAdapter.php';
+            if (!PrestmitAdapter::valid_url($input['api_url'] ?? '')) {
+                $errors[] = 'Prestmit URL must be https://dev-api.prestmit.io/partners/v1 or https://api.prestmit.io/partners/v1.';
+            }
+            // URL-only rotation leaves the entire encrypted credential set intact.
+            if (!empty($input['api_key'])) {
+                if (trim((string)($input['prestmit_api_secret'] ?? '')) === '') {
+                    $errors[] = 'Prestmit requires its API secret alongside the key.';
+                }
+                if (!preg_match('/^[0-9]{4,6}$/', trim((string)($input['prestmit_account_pin'] ?? '')))) {
+                    $errors[] = 'Prestmit requires the account PIN (4 to 6 digits, including leading zeros).';
+                }
+                if (preg_match('/[\r\n]/', (string)$input['api_key'])) {
+                    $errors[] = 'Prestmit key contains invalid header characters.';
+                }
+            } elseif (!empty($input['prestmit_api_secret']) || !empty($input['prestmit_account_pin'])) {
+                $errors[] = 'To rotate Prestmit credentials, supply the key, secret and PIN together.';
+            }
         }
         if (isset($input['api_type']) && strtoupper($input['api_type']) === 'FIVESIM') {
             foreach ($this->fivesim_url_errors($input) as $e) $errors[] = $e;
@@ -1196,7 +1234,27 @@ class ProviderSyncService {
                 return stripos($e, 'API key') === false;
             }));
         }
+        if (strtoupper($provider->api_type) === 'PRESTMIT' && !$rotate_key
+            && rtrim(trim((string)($input['api_url'] ?? '')), '/') !== rtrim($provider->api_url, '/')) {
+            $errors[] = 'Switching Prestmit environments requires that environment’s key, secret and PIN.';
+        }
         if ($errors) return array('ok' => false, 'errors' => $errors);
+
+        if (strtoupper($provider->api_type) === 'PRESTMIT'
+            && rtrim(trim((string)$input['api_url']), '/') !== rtrim($provider->api_url, '/')
+            && $this->ci->db->table_exists('giftcard_sales')
+            && $this->ci->db->where('provider_id', $provider->id)
+                ->where_in('status', array('QUOTED', 'REVIEW', 'SUBMITTING', 'PENDING'))
+                ->count_all_results('giftcard_sales') > 0) {
+            return array('ok' => false, 'errors' => array('This provider has open gift-card sales. Use a separate provider row for the other environment.'));
+        }
+
+        if (strtoupper($provider->api_type) === 'PRESTMIT'
+            && rtrim(trim((string)$input['api_url']), '/') !== rtrim($provider->api_url, '/')
+            && $this->ci->db->where('provider_id', $provider->id)->where('service_domain', 'GIFTCARD')
+                ->where_in('status', array('PENDING', 'PROCESSING'))->count_all_results('service_transactions') > 0) {
+            return array('ok' => false, 'errors' => array('This provider has unresolved gift-card purchases. Use a separate provider row for another environment.'));
+        }
 
         $before = array('api_url' => $provider->api_url);
 

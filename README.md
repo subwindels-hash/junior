@@ -51,10 +51,14 @@ services and supported products within the Active Digital Hub ecosystem.
   which makes the panel usable even without the Tailwind build).
 - **Domain services** live in `application/libraries/` (OrderService, LedgerService,
   PaymentService, GiftcardService, MarketplaceService, …). Providers (SMM panels,
-  VTpass, 5sim, Dojah, Reloadly) sit behind adapter interfaces with mock adapters
+  VTpass, 5sim, Dojah, Reloadly, Prestmit) sit behind adapter interfaces with mock adapters
   for development and tests — **mock adapters are refused outright in production**
   (deploy preflight fails while an active provider row uses one, and
-  `Provider_manager` refuses to build one at runtime).
+  `Provider_manager` refuses to build one at runtime). Prestmit currently covers
+  gift-card purchasing and [opt-in NGN e-code/physical selling](docs/module-prestmit-sell.md);
+  see the [sandbox setup and remaining integration scope](docs/module-prestmit-provider.md).
+  Prestmit provider details also link to a permission-gated, read-only partner treasury
+  view (masked bank accounts and reported wallet/payout history; no transfers).
 - **Money** is `DECIMAL(20,8)` everywhere and moves only through
   `LedgerService` — wallet balances are rows plus ledger entries, never raw
   increments. The schema linter and CI both enforce this.
@@ -277,7 +281,7 @@ application/models/              query objects (one per aggregate table)
 application/libraries/           domain services + provider adapters
   Provider_manager.php           family registry → adapter (SMM/VTU/NUMBER/IDENTITY/GIFTCARD)
   *Adapter.php                   StandardSmmAdapter, VtpassAdapter, FiveSimAdapter,
-                                 DojahAdapter, ReloadlyAdapter + MOCK_* offline doubles
+                                 DojahAdapter, ReloadlyAdapter, PrestmitAdapter + MOCK_* offline doubles
   SecureHttpClient.php           TLS-verify + SSRF egress guard for every outbound call
   TransactionEngine.php          atomic wallet-debit + ledger + order commit
   LedgerService.php              the ONLY path that mutates wallet balances
@@ -434,6 +438,7 @@ Sandbox vs production endpoints are chosen by the base URL env var.
 | Virtual numbers / OTP | `FiveSimAdapter` | `FIVESIM_BASE_URL` (current 5sim protocol, `https://5sim.net/v1` only — the deprecated API1/`handler_api` protocol is refused) | `FIVESIM_API_KEY` (the dashboard key "API key for 5sim protocol", **not** the one labelled Deprecated API), `FIVESIM_RATE_TO_BASE` |
 | KYC / identity (NIN, BVN) | `DojahAdapter` | `sandbox.dojah.io` → `api.dojah.io` | `DOJAH_*` (billable per lookup) |
 | Gift cards | `ReloadlyAdapter` | `giftcards-sandbox.reloadly.com` → `giftcards.reloadly.com` | `RELOADLY_*` (OAuth2, token cached, audience pinned to base URL) |
+| Gift-card buying / e-code and physical sales | `PrestmitAdapter` | `dev-api.prestmit.io` → `api.prestmit.io` (sandbox blocked in production) | encrypted credentials in Admin → Providers; selling additionally requires `PRESTMIT_SELL_*` opt-in configuration |
 | Card/bank payments | Paystack, Stripe, Flutterwave, Razorpay, PayPal, CoinPayments, manual bank transfer | per-gateway dashboard keys | `*_SECRET_KEY`, webhook secrets — idempotent, signature-verified |
 | Object storage | AWS S3 / Cloudflare R2 (dev: MinIO) | `STORAGE_ENDPOINT` | `STORAGE_*` |
 | Email | SMTP (dev: MailHog) | any provider | `SMTP_*` |

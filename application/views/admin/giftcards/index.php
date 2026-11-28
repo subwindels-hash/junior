@@ -13,6 +13,7 @@ $undelivered = (int)($order_counts['PLACED'] ?? 0);
 <div class="row justify-between mb-4" style="align-items:flex-start;flex-wrap:wrap;gap:.75rem">
   <div>
     <h2 class="mb-0" style="font-size:1.4rem;font-weight:600">Gift cards</h2>
+    <a class="btn btn-secondary btn-sm" href="<?=site_url('admin/giftcards/sales')?>">Review customer sales</a>
     <p class="muted text-sm"><?=number_format((int)$total)?> order<?=$total == 1 ? '' : 's'?> matching this view</p>
   </div>
   <form method="get" action="<?=site_url('admin/giftcards')?>" class="row" style="gap:.35rem">

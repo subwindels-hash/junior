@@ -79,6 +79,8 @@ class Cron extends Cron_Controller {
      * paid for nothing they can spend. The same sweep writes off orders the
      * vendor never fulfilled, which refunds them.
      */
+    public function giftcard_sales() { $this->execute('giftcard_sales'); }
+
     public function giftcard_codes() {
         $this->execute('giftcard_codes');
     }

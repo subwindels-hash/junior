@@ -201,21 +201,26 @@ class Coupon_model extends MY_Model {
      */
     public function release_redemption($redemption_id, $coupon_id = null) {
         $redemption_id = (int)$redemption_id;
-        if ($redemption_id <= 0) return false;
-
-        if ($coupon_id === null) {
-            $row = $this->db->where('id', $redemption_id)->get('coupon_redemptions')->row();
-            $coupon_id = $row ? (int)$row->coupon_id : 0;
+        if ($redemption_id <= 0 || !$this->db->trans_begin()) return false;
+        try {
+            $row = $this->db->query('SELECT * FROM coupon_redemptions WHERE id=? FOR UPDATE', array($redemption_id))->row();
+            // Idempotent repeat: nothing was deleted, so no counter may move.
+            if (!$row) { return $this->db->trans_commit(); }
+            if ($coupon_id !== null && (int)$coupon_id !== (int)$row->coupon_id) {
+                $this->db->trans_rollback();
+                return false;
+            }
+            if (!$this->db->where('id', $redemption_id)->where('coupon_id', (int)$row->coupon_id)->delete('coupon_redemptions')
+                || $this->db->affected_rows() !== 1) throw new RuntimeException('Coupon reservation changed.');
+            if (!$this->db->set('times_used', 'times_used - 1', false)
+                ->where('id', (int)$row->coupon_id)->where('times_used >', 0)->update($this->table)
+                || !$this->db->trans_status()) throw new RuntimeException('Coupon release could not be saved.');
+            if (!$this->db->trans_commit()) throw new RuntimeException('Coupon release could not be committed.');
+            return true;
+        } catch (Throwable $e) {
+            $this->db->trans_rollback();
+            return false;
         }
-        $this->db->where('id', $redemption_id)->delete('coupon_redemptions');
-
-        if ($coupon_id > 0) {
-            // Never below zero: a double release must not make a spent coupon
-            // look fresh.
-            $this->db->set('times_used', 'times_used - 1', false)
-                ->where('id', $coupon_id)->where('times_used >', 0)->update($this->table);
-        }
-        return true;
     }
 
     /**

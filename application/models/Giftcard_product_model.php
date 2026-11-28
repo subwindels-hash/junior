@@ -166,7 +166,7 @@ class Giftcard_product_model extends MY_Model {
         // The code has to distinguish denominations of the same vendor product,
         // because Reloadly gives a $25 and a $50 Amazon card the same productId.
         $code = strtoupper(preg_replace('/[^A-Za-z0-9]+/', '-',
-            ($v['brand_name'] ?? 'CARD').'-'.$country.'-'
+            ($v['catalogue_key'] ?? ($v['brand_name'] ?? 'CARD')).'-'.$country.'-'
             .($type === 'RANGE' ? 'RANGE' : rtrim(rtrim((string)$face, '0'), '.'))));
 
         $existing = $this->find_by_code($code);

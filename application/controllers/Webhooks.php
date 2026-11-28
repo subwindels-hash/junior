@@ -28,6 +28,23 @@ class Webhooks extends MY_Controller {
         $this->output->set_header('Content-Type: application/json');
     }
 
+    /** Dedicated signed provider hook; never enters the wallet top-up pipeline. */
+    public function prestmit($provider_id) {
+        if ($this->input->method(true) !== 'POST') {
+            $this->output->set_header('Allow: POST')->set_status_header(405)->set_output('{}');
+            return;
+        }
+        $raw = file_get_contents('php://input', false, null, 0, 65537);
+        if ($raw === false || strlen($raw) > 65536) {
+            $this->output->set_status_header(413)->set_output('{}');
+            return;
+        }
+        $this->load->library('PrestmitWebhookService');
+        $res = $this->prestmitwebhookservice->receive((int)$provider_id, $raw,
+            (string)$this->input->get_request_header('X-Prestmit-Signature', false));
+        $this->output->set_header('Cache-Control: no-store')->set_status_header($res['status'])->set_output('{}');
+    }
+
     /**
      * POST /webhook/(:gateway)
      */

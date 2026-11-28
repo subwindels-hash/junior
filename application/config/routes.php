@@ -149,6 +149,9 @@ $route['dashboard/giftcards'] = 'dashboard/giftcards/index';
 $route['dashboard/giftcards/history'] = 'dashboard/giftcards/history';
 $route['dashboard/giftcards/buy'] = 'dashboard/giftcards/buy';
 $route['dashboard/giftcards/(:any)/reveal/(:any)'] = 'dashboard/giftcards/reveal/$1/$2';
+$route['dashboard/giftcards/sell'] = 'dashboard/giftcard_sales/index';
+$route['dashboard/giftcards/sell/quote'] = 'dashboard/giftcard_sales/quote';
+$route['dashboard/giftcards/sell/(:any)/submit'] = 'dashboard/giftcard_sales/submit/$1';
 $route['dashboard/giftcards/(:any)'] = 'dashboard/giftcards/detail/$1';
 
 // Marketplace: customers browse and buy only. Selling is staff-side
@@ -241,6 +244,11 @@ $route['admin/identity/(:any)/purge'] = 'admin/identity/purge/$1';
 $route['admin/identity/(:any)'] = 'admin/identity/detail/$1';
 $route['admin/analytics'] = 'admin/analytics/index';
 $route['admin/giftcards'] = 'admin/giftcards/index';
+$route['admin/giftcards/sales/(:any)/images/(:num)'] = 'admin/giftcard_sales/image/$1/$2';
+$route['admin/giftcards/sales'] = 'admin/giftcard_sales/index';
+$route['admin/giftcards/sales/(:any)/dispatch'] = 'admin/giftcard_sales/dispatch/$1';
+$route['admin/giftcards/sales/(:any)/reject'] = 'admin/giftcard_sales/reject/$1';
+$route['admin/giftcards/sales/(:any)/reconcile'] = 'admin/giftcard_sales/reconcile/$1';
 $route['admin/giftcards/(:any)/collect'] = 'admin/giftcards/collect/$1';
 $route['admin/giftcards/(:any)/abandon'] = 'admin/giftcards/abandon/$1';
 $route['admin/giftcards/(:any)/refund'] = 'admin/giftcards/refund/$1';
@@ -319,6 +327,7 @@ $route['admin/categories/(:any)/save'] = 'admin/system/save_category/$1';
 $route['admin/categories/(:any)/delete'] = 'admin/system/delete_category/$1';
 $route['admin/providers'] = 'admin/providers/index';
 $route['admin/providers/create'] = 'admin/providers/create';
+$route['admin/providers/(:any)/treasury'] = 'admin/prestmit_treasury/index/$1';
 $route['admin/providers/(:any)/pricing'] = 'admin/providers/pricing/$1';
 $route['admin/providers/(:any)/test'] = 'admin/providers/test/$1';
 $route['admin/providers/(:any)/sync'] = 'admin/providers/sync/$1';
@@ -491,6 +500,7 @@ $route['api/docs/json'] = 'api_v1/docs_json';
 // The VTpass transaction-update push gets a dedicated handler (unsigned JSON,
 // settled through a /requery rather than the payment-event pipeline); the
 // literal must precede the wildcard or CI would route it to index('vtpass').
+$route['webhook/prestmit/(:num)'] = 'webhooks/prestmit/$1';
 $route['webhook/vtpass'] = 'webhooks/vtpass';
 // Optional signed trigger for hosts that can only call a URL, not `php index.php cron`.
 // It runs the same locked currency_rates job as cron/Admin, and requires a secret.

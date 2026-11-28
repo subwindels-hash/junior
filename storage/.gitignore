@@ -10,3 +10,8 @@
 ticket_attachments/*
 !ticket_attachments/.htaccess
 !ticket_attachments/index.html
+
+!giftcard_images/
+giftcard_images/*
+!giftcard_images/.htaccess
+!giftcard_images/index.html

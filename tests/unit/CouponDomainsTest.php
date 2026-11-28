@@ -300,6 +300,18 @@ class CouponDomainsTest extends TestCase
 
     /* ============================ gift cards ============================ */
 
+    public function testGoodwillRefundOfACompletedPurchaseDoesNotResetItsCoupon() {
+        list($app, $user) = $this->app();
+        $coupon = $this->coupon($app);
+        $res = $app->vtuservice->airtime($user, array('network' => 'MTN', 'msisdn' => '08031234567',
+            'amount' => '1000', 'coupon_code' => $coupon->code));
+        $this->assertTrue($res['ok']);
+        $this->assertSame('SUCCESSFUL', $res['transaction']->status);
+        $this->assertTrue($app->transactionengine->transition($res['transaction']->id, 'REFUNDED', 'ADMIN')['ok']);
+        $this->assertCount(1, $this->redemptions($app, $coupon, $user));
+        $this->assertSame(1, (int)$app->Coupon_model->find_by_id($coupon->id)->times_used);
+    }
+
     public function testAGiftcardPurchaseRedeemsACoupon()
     {
         list($app, $user) = $this->app();

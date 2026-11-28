@@ -114,7 +114,7 @@ services:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./docker/mysql/init.sql.gz:/docker-entrypoint-initdb.d/init.sql.gz:ro
     healthcheck:
       # Ping with the dedicated app account, not root — a broken grant is a
       # broken app, and "root works" would hide it.

@@ -645,7 +645,7 @@ class CpanelDeploymentTest extends TestCase
             'storage/devdb/', 'storage/digital_products/', 'storage/logs/', 'storage/cache/',
             // Support attachments are customers' documents (module 17): the
             // package ships the guarded directory, never what is in it.
-            'storage/ticket_attachments/',
+            'storage/ticket_attachments/', 'storage/giftcard_images/',
             'assets/uploads/',
         );
         $guards = array('.htaccess', 'index.html', 'index.php');
@@ -679,7 +679,8 @@ class CpanelDeploymentTest extends TestCase
 
             // Only the directories a running panel reads are packaged.
             $included_prefix = array(
-                'application/', 'assets/', 'storage/', 'cron/', 'database/', 'docs/cpanel-deployment.md',
+                'application/', 'assets/', 'storage/', 'cron/', 'database/', 'docs/cpanel-deployment.md', 'docs/module-prestmit-provider.md',
+                'docs/module-prestmit-sell.md', 'docs/prestmit-completion-audit.md',
             );
                 $included_root = array('.htaccess', '.env.example', 'index.php', 'deploy-verify.php');
             $root_ok = in_array($rel, $included_root, true);

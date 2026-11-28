@@ -22,6 +22,7 @@
 !/storage/cache/index.html
 !/storage/cache/sessions/
 /storage/cache/sessions/*
+!/storage/cache/sessions/.gitignore
 !/storage/cache/sessions/.htaccess
 !/storage/cache/sessions/index.html
 !/storage/cache/ratelimit/
@@ -44,3 +45,15 @@
 
 # PHP error log written to the web root on shared hosting (may contain paths).
 error_log
+
+# Encrypted physical gift-card images are runtime secrets, never source artifacts.
+/storage/giftcard_images/*
+!/storage/giftcard_images/.htaccess
+!/storage/giftcard_images/index.html
+
+# Release archives are reproducible artifacts, not source files.
+/application-deployment.zip
+
+# Local Python tooling and interpreter caches.
+.venv/
+__pycache__/
