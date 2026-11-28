@@ -154,7 +154,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array('status' => 0, 'value' => 50000)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 0, 'value' => 50000)));
         $this->assertSame('PENDING', $event['status']);
     }
 
@@ -165,7 +165,7 @@ class BlockonomicsTest extends TestCase
         $gw = new BlockonomicsGateway();
 
         // 50,000 satoshi == the quoted 0.0005 BTC.
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 50000)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 50000)));
         $this->assertSame('SUCCESS', $event['status']);
         $this->assertSame('0.00050000', $event['amount']);
         $this->assertSame('deadbeef', $event['provider_tx_id']);
@@ -182,7 +182,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 25000)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 25000)));
         $this->assertSame('UNDERPAID', $event['status']);
     }
 
@@ -194,7 +194,7 @@ class BlockonomicsTest extends TestCase
         $gw = new BlockonomicsGateway();
 
         // 0.2% under the 50,000 satoshi quote; tolerance is 0.5%.
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 49900)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 49900)));
         $this->assertSame('SUCCESS', $event['status']);
     }
 
@@ -204,7 +204,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = null; // never issued by us
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 999999)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 999999)));
         $this->assertSame('IGNORED', $event['status']);
         $this->assertArrayNotHasKey('payment_transaction_id', $event['metadata']);
     }
@@ -220,9 +220,9 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $first  = $gw->parse_event($this->callback(array('status' => 1, 'value' => 50000)));
-        $replay = $gw->parse_event($this->callback(array('status' => 1, 'value' => 50000)));
-        $next   = $gw->parse_event($this->callback(array('status' => 2, 'value' => 50000)));
+        $first  = $gw->parse_event($this->callbackBody(array('status' => 1, 'value' => 50000)));
+        $replay = $gw->parse_event($this->callbackBody(array('status' => 1, 'value' => 50000)));
+        $next   = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 50000)));
 
         $this->assertSame($first['event_id'], $replay['event_id'], 'a replay must be a duplicate');
         $this->assertNotSame($first['event_id'], $next['event_id'], 'a new confirmation must be a new event');
@@ -284,7 +284,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array(
+        $event = $gw->parse_event($this->callbackBody(array(
             'status' => 0, 'value' => 50000, 'rbf' => 1,
         )));
 
@@ -301,7 +301,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 50000)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 50000)));
         $this->assertSame('SUCCESS', $event['status']);
         $this->assertArrayNotHasKey('rbf', $event['metadata']);
     }
@@ -321,7 +321,7 @@ class BlockonomicsTest extends TestCase
         $gw = new BlockonomicsGateway();
 
         // 500000 base units == 0.5 USDT: the full quote, paid in full.
-        $event = $gw->parse_event($this->callback(array(
+        $event = $gw->parse_event($this->callbackBody(array(
             'status' => 2, 'value' => 500000, 'crypto' => 'USDT',
         )));
         $this->assertSame('SUCCESS', $event['status']);
@@ -329,7 +329,7 @@ class BlockonomicsTest extends TestCase
         $this->assertSame('USDT', $event['currency']);
 
         // 0.25 USDT against a 0.5 quote is short - in USDT terms, not satoshis.
-        $short = $gw->parse_event($this->callback(array(
+        $short = $gw->parse_event($this->callbackBody(array(
             'status' => 2, 'value' => 250000, 'crypto' => 'USDT',
         )));
         $this->assertSame('UNDERPAID', $short['status']);
@@ -342,7 +342,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array(
+        $event = $gw->parse_event($this->callbackBody(array(
             'status' => 2, 'value' => 100, 'crypto' => 'ETH',
         )));
         $this->assertSame('IGNORED', $event['status']);
@@ -356,7 +356,7 @@ class BlockonomicsTest extends TestCase
         $ci->db->address_row = $this->addressRow();
         $gw = new BlockonomicsGateway();
 
-        $event = $gw->parse_event($this->callback(array('status' => 2, 'value' => 50000)));
+        $event = $gw->parse_event($this->callbackBody(array('status' => 2, 'value' => 50000)));
         $this->assertSame('BTC', $event['currency']);
         $this->assertSame('SUCCESS', $event['status']);
     }
@@ -401,7 +401,7 @@ class BlockonomicsTest extends TestCase
         );
     }
 
-    private function callback(array $overrides)
+    private function callbackBody(array $overrides)
     {
         return http_build_query(array_merge(array(
             'addr' => 'bc1qexampleaddress000000',
